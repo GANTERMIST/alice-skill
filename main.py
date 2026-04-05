@@ -85,45 +85,46 @@ async def root():
 async def alice_webhook(request: Request):
     body = await request.json()
 
-    # ── ЛОГИРУЕМ ВСЁ что пришло от Алисы ─────────────────────────────────────
-    print("=== INCOMING REQUEST ===")
+    print("=== REQUEST ===")
     print(json.dumps(body, ensure_ascii=False, indent=2))
-    print("========================")
 
     user_text: str = body.get("request", {}).get("original_utterance", "").lower().strip()
     is_new_session: bool = body.get("session", {}).get("new", False)
     session_id: str = body.get("session", {}).get("session_id", "")
 
-    # Пробуем получить токен из разных мест — у Яндекса он может быть в разных полях
     user_token: str | None = (
         body.get("session", {}).get("user", {}).get("access_token")
-        or body.get("account_linking_complete_event", {}).get("access_token")
-        or body.get("session", {}).get("access_token")
     )
 
-    print(f"TOKEN FOUND: {'ДА — ' + user_token[:15] + '...' if user_token else 'НЕТ'}")
+    print(f"TOKEN: {'ДА' if user_token else 'НЕТ'}")
 
-    # ── Нет токена ────────────────────────────────────────────────────────────
+    # ── Нет токена — запускаем OAuth через директиву ──────────────────────────
     if not user_token:
         if is_new_session:
-            return _reply(
-                "Привет! Для работы с диском нужно войти в аккаунт. "
-                "Нажми кнопку входа чтобы продолжить.",
-                buttons=[{"title": "Войти", "hide": False}]
-            )
-        return _reply(
-            "Нужно войти в аккаунт. Нажми кнопку Войти.",
-            buttons=[{"title": "Войти", "hide": False}]
-        )
+            # При старте новой сессии — сразу запускаем привязку аккаунта
+            return {
+                "response": {
+                    "text": "Привет! Для работы с диском нужно войти в аккаунт Яндекса.",
+                    "end_session": False
+                },
+                "start_account_linking": {},  # ← вот эта директива запускает OAuth
+                "version": "1.0"
+            }
+        else:
+            # В середине разговора — тоже запускаем
+            return {
+                "response": {
+                    "text": "Нужно войти в аккаунт Яндекса.",
+                    "end_session": False
+                },
+                "start_account_linking": {},  # ← ключевая директива
+                "version": "1.0"
+            }
 
-    # ── Новая сессия ──────────────────────────────────────────────────────────
+    # ── Есть токен — работаем ─────────────────────────────────────────────────
     if is_new_session:
-        return _reply(
-            "Привет! Я могу найти файлы на твоём Яндекс Диске. "
-            "Скажи: найди файл отчёт, или: покажи последние файлы."
-        )
+        return _reply("Привет! Скажи: найди файл, или: покажи последние файлы.")
 
-    # ── Последние файлы ───────────────────────────────────────────────────────
     if any(w in user_text for w in ["последн", "недавн", "новые файлы", "что есть"]):
         files = await list_recent_files(user_token)
         sessions[session_id] = files
@@ -131,7 +132,6 @@ async def alice_webhook(request: Request):
             return _reply("На диске не нашла ни одного документа.")
         return _reply(format_file_list(files) + ". Назови номер файла чтобы получить ссылку.")
 
-    # ── Поиск файла ───────────────────────────────────────────────────────────
     if any(w in user_text for w in ["найди", "поищи", "найти", "поиск", "ищи"]):
         query = extract_search_query(user_text)
         if not query:
@@ -139,10 +139,9 @@ async def alice_webhook(request: Request):
         files = await search_disk(user_token, query)
         sessions[session_id] = files
         if not files:
-            return _reply(f"Не нашла файлов по запросу «{query}». Попробуй другое название.")
+            return _reply(f"Не нашла файлов по запросу «{query}».")
         return _reply(format_file_list(files) + ". Назови номер чтобы получить ссылку.")
 
-    # ── Выбор файла по номеру ─────────────────────────────────────────────────
     number_words = {
         "первый": 1, "первую": 1, "первое": 1, "один": 1, "1": 1,
         "второй": 2, "вторую": 2, "второе": 2, "два": 2, "2": 2,
@@ -169,29 +168,22 @@ async def alice_webhook(request: Request):
             else:
                 return _reply(f"Не смогла создать ссылку на «{clean_name}».")
         else:
-            return _reply(f"У меня только {len(files)} файлов. Назови номер от 1 до {len(files)}.")
+            return _reply(f"У меня только {len(files)} файлов.")
 
-    # ── Помощь ────────────────────────────────────────────────────────────────
-    if any(w in user_text for w in ["помощь", "помоги", "что умеешь", "команды"]):
-        return _reply(
-            "Я умею искать файлы на Яндекс Диске. "
-            "Скажи: найди файл отчёт. "
-            "Или: покажи последние файлы."
-        )
+    if any(w in user_text for w in ["помощь", "помоги", "что умеешь"]):
+        return _reply("Скажи: найди файл отчёт. Или: покажи последние файлы.")
 
-    # ── Выход ─────────────────────────────────────────────────────────────────
-    if any(w in user_text for w in ["пока", "выход", "закрой", "стоп", "хватит"]):
+    if any(w in user_text for w in ["пока", "выход", "закрой", "стоп"]):
         return _reply("До встречи!", end=True)
 
-    # ── Не понял ──────────────────────────────────────────────────────────────
-    return _reply("Не поняла команду. Скажи: найди файл, покажи последние файлы, или: помощь.")
+    return _reply("Не поняла. Скажи: найди файл, покажи последние файлы, или: помощь.")
 
 
-def _reply(text: str, end: bool = False, buttons: list | None = None) -> dict:
-    response = {"text": text, "end_session": end}
-    if buttons:
-        response["buttons"] = buttons
-    return {"response": response, "version": "1.0"}
+def _reply(text: str, end: bool = False) -> dict:
+    return {
+        "response": {"text": text, "end_session": end},
+        "version": "1.0"
+    }
 
 
 if __name__ == "__main__":
