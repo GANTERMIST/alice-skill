@@ -13,6 +13,17 @@ async def root():
 async def alice_webhook(request: Request):
     body = await request.json()
 
+    user_token = body.get("session", {}).get("user", {}).get("access_token")
+
+    if not user_token:
+        return {
+            "response": {
+                "text": "Пожалуйста, войди в аккаунт чтобы я мог помочь.",
+                "end_session": False
+            },
+            "version": "1.0"
+        }
+
     user_text: str = body.get("request", {}).get("original_utterance", "").lower().strip()
     is_new_session: bool = body.get("session", {}).get("new", False)
 
