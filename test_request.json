@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "locale": "ru-RU",
+    "timezone": "Europe/Moscow",
+    "client_id": "ru.yandex.searchplugin/7.116"
+  },
+  "request": {
+    "command": "покажи встречи на сегодня",
+    "original_utterance": "покажи встречи на сегодня",
+    "type": "SimpleUtterance",
+    "nlu": {
+      "tokens": ["покажи", "встречи", "на", "сегодня"],
+      "entities": []
+    }
+  },
+  "session": {
+    "message_id": 1,
+    "session_id": "test-session-123",
+    "skill_id": "твой-skill-id",
+    "user_id": "test-user-456",
+    "new": false
+  },
+  "version": "1.0"
+}
