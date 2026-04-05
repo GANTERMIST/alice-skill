@@ -2,7 +2,14 @@ from fastapi import FastAPI, Request
 import uvicorn
 import httpx
 import json
+import os
 
+DEBUG_TOKEN = os.getenv("DEBUG_TOKEN", "")
+
+user_token = (
+    body.get("session", {}).get("user", {}).get("access_token")
+    or DEBUG_TOKEN
+)
 app = FastAPI()
 
 
