@@ -3,19 +3,139 @@ import uvicorn
 import httpx
 import json
 import os
-import asyncio
-import uuid
-from datetime import datetime, timedelta, date
+import base64
+from datetime import date, timedelta
 
 app = FastAPI()
 
 YANDEX_GPT_API_KEY = os.getenv("YANDEX_GPT_API_KEY")
 YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")
+PERSONA_FILENAME = "persona_alice.txt"
+PERSONA_DISK_PATH = f"disk:/{PERSONA_FILENAME}"
 
-# ── YandexGPT ────────────────────────────────────────────────────────────────
+# ── Persona — чтение и запись на Яндекс Диск ─────────────────────────────────
 
-async def understand_intent(user_text: str) -> dict:
-    prompt = f"""Ты — анализатор команд для голосового ассистента.
+async def read_persona(token: str) -> str | None:
+    """Читаем файл persona_alice.txt с диска пользователя"""
+    headers = {"Authorization": f"OAuth {token}"}
+    try:
+        # Получаем ссылку на скачивание
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://cloud-api.yandex.net/v1/disk/resources/download",
+                headers=headers,
+                params={"path": PERSONA_DISK_PATH}
+            )
+        if resp.status_code != 200:
+            print(f"PERSONA READ: файл не найден ({resp.status_code})")
+            return None
+
+        download_url = resp.json().get("href")
+        if not download_url:
+            return None
+
+        # Скачиваем содержимое
+        async with httpx.AsyncClient() as client:
+            resp2 = await client.get(download_url)
+
+        content = resp2.text
+        print(f"PERSONA READ: прочитано {len(content)} символов")
+        return content
+
+    except Exception as e:
+        print(f"PERSONA READ ERROR: {e}")
+        return None
+
+
+async def write_persona(token: str, content: str) -> bool:
+    """Записываем/обновляем файл persona_alice.txt на диске"""
+    headers = {"Authorization": f"OAuth {token}"}
+    try:
+        # Получаем ссылку на загрузку (overwrite=true — перезапишет если есть)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://cloud-api.yandex.net/v1/disk/resources/upload",
+                headers=headers,
+                params={"path": PERSONA_DISK_PATH, "overwrite": "true"}
+            )
+        if resp.status_code != 200:
+            print(f"PERSONA WRITE: не удалось получить URL ({resp.status_code})")
+            return False
+
+        upload_url = resp.json().get("href")
+        if not upload_url:
+            return False
+
+        # Загружаем файл
+        async with httpx.AsyncClient() as client:
+            resp2 = await client.put(
+                upload_url,
+                content=content.encode("utf-8"),
+                headers={"Content-Type": "text/plain; charset=utf-8"}
+            )
+
+        success = resp2.status_code in (200, 201)
+        print(f"PERSONA WRITE: {'успешно' if success else 'ошибка ' + str(resp2.status_code)}")
+        return success
+
+    except Exception as e:
+        print(f"PERSONA WRITE ERROR: {e}")
+        return False
+
+
+async def update_persona(token: str, old_persona: str | None, user_text: str, assistant_reply: str) -> None:
+    """Обновляем портрет пользователя через GPT после каждого сообщения"""
+    old_text = old_persona or "Данных пока нет."
+
+    prompt = f"""Ты — система создания портрета пользователя для голосового ассистента.
+
+Текущий портрет пользователя:
+{old_text}
+
+Пользователь только что сказал: "{user_text}"
+Ассистент ответил: "{assistant_reply}"
+
+Обнови портрет пользователя — добавь новые факты которые можно узнать из этого диалога.
+Портрет должен содержать:
+- Имя (если известно)
+- Интересы и предпочтения
+- Часто используемые команды
+- Рабочий контекст (файлы которые ищет, темы писем)
+- Любые другие полезные детали
+
+Пиши кратко, в формате списка фактов. Не повторяй то что уже есть.
+Верни ТОЛЬКО обновлённый портрет, без пояснений:"""
+
+    headers = {
+        "Authorization": f"Api-Key {YANDEX_GPT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite",
+        "completionOptions": {"stream": False, "temperature": 0.3, "maxTokens": 300},
+        "messages": [{"role": "user", "text": prompt}]
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
+                "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+                headers=headers, json=payload
+            )
+        if resp.status_code == 200:
+            new_persona = resp.json()["result"]["alternatives"][0]["message"]["text"]
+            await write_persona(token, new_persona)
+            print(f"PERSONA UPDATED: {new_persona[:100]}...")
+    except Exception as e:
+        print(f"PERSONA UPDATE ERROR: {e}")
+
+
+# ── YandexGPT — понимание намерений ──────────────────────────────────────────
+
+async def understand_intent(user_text: str, persona: str | None) -> dict:
+    persona_context = f"\nКонтекст о пользователе:\n{persona}\n" if persona else ""
+
+    prompt = f"""Ты — анализатор команд для голосового ассистента.{persona_context}
 Пользователь сказал: "{user_text}"
 
 Определи намерение и верни ТОЛЬКО JSON без пояснений:
@@ -26,9 +146,7 @@ async def understand_intent(user_text: str) -> dict:
 - get_link — получить ссылку на файл по номеру (нужен параметр "number" от 1 до 5)
 - read_mail — прочитать последние письма
 - search_mail — найти письма от отправителя (нужен параметр "sender")
-- calendar_today — показать встречи на сегодня
-- calendar_tomorrow — показать встречи на завтра
-- create_event — создать событие (нужны параметры "title", "time" в формате HH:MM)
+- chat — просто поговорить или задать вопрос (нужен параметр "message")
 - help — помощь
 - exit — выход
 - unknown — непонятная команда
@@ -40,9 +158,8 @@ async def understand_intent(user_text: str) -> dict:
 "дай ссылку на первый" -> {{"intent": "get_link", "number": 1}}
 "прочитай почту" -> {{"intent": "read_mail"}}
 "письма от Иванова" -> {{"intent": "search_mail", "sender": "Иванов"}}
-"что у меня сегодня" -> {{"intent": "calendar_today"}}
-"встречи на завтра" -> {{"intent": "calendar_tomorrow"}}
-"создай встречу совещание в 15:00" -> {{"intent": "create_event", "title": "совещание", "time": "15:00"}}
+"как дела" -> {{"intent": "chat", "message": "как дела"}}
+"что такое машинное обучение" -> {{"intent": "chat", "message": "что такое машинное обучение"}}
 "пока" -> {{"intent": "exit"}}
 
 Верни ТОЛЬКО JSON:"""
@@ -73,6 +190,43 @@ async def understand_intent(user_text: str) -> dict:
     return fallback_intent(user_text)
 
 
+async def chat_with_gpt(message: str, persona: str | None) -> str:
+    """Свободный разговор с GPT с учётом портрета пользователя"""
+    persona_block = f"Информация о пользователе:\n{persona}\n\n" if persona else ""
+
+    system = (
+        f"Ты — голосовой ассистент Алиса для корпоративного использования. "
+        f"Отвечай кратко и по делу — ответ будет озвучен голосом. "
+        f"Максимум 2-3 предложения.\n{persona_block}"
+    )
+
+    headers = {
+        "Authorization": f"Api-Key {YANDEX_GPT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite",
+        "completionOptions": {"stream": False, "temperature": 0.5, "maxTokens": 150},
+        "messages": [
+            {"role": "system", "text": system},
+            {"role": "user", "text": message}
+        ]
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
+                "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+                headers=headers, json=payload
+            )
+        if resp.status_code == 200:
+            return resp.json()["result"]["alternatives"][0]["message"]["text"]
+    except Exception as e:
+        print(f"CHAT GPT ERROR: {e}")
+
+    return "Не смогла ответить на этот вопрос."
+
+
 def fallback_intent(text: str) -> dict:
     t = text.lower()
     if any(w in t for w in ["найди", "поищи", "найти"]):
@@ -84,10 +238,6 @@ def fallback_intent(text: str) -> dict:
         return {"intent": "list_disk"}
     if any(w in t for w in ["почт", "письм"]):
         return {"intent": "read_mail"}
-    if any(w in t for w in ["сегодня", "план", "расписание"]):
-        return {"intent": "calendar_today"}
-    if "завтра" in t:
-        return {"intent": "calendar_tomorrow"}
     if any(w in t for w in ["пока", "выход", "стоп"]):
         return {"intent": "exit"}
     if any(w in t for w in ["помощь", "помоги"]):
@@ -100,7 +250,7 @@ def fallback_intent(text: str) -> dict:
     for word, num in numbers.items():
         if word in t:
             return {"intent": "get_link", "number": num}
-    return {"intent": "unknown"}
+    return {"intent": "chat", "message": text}
 
 
 # ── Яндекс Диск ──────────────────────────────────────────────────────────────
@@ -112,7 +262,6 @@ async def list_recent_files(token: str) -> list[dict]:
             headers={"Authorization": f"OAuth {token}"},
             params={"limit": 7, "fields": "items.name,items.path,items.created"}
         )
-    print(f"DISK STATUS: {resp.status_code}")
     if resp.status_code != 200:
         return []
     return resp.json().get("items", [])
@@ -162,7 +311,6 @@ async def get_recent_emails(token: str) -> list[dict]:
                 headers={"Authorization": f"OAuth {token}"},
                 params={"fid": 1, "first": 0, "last": 5}
             )
-        print(f"MAIL STATUS: {resp.status_code}, {resp.text[:200]}")
         if resp.status_code == 200:
             return resp.json().get("envelopes", [])
     except Exception as e:
@@ -176,126 +324,12 @@ def format_emails(emails: list[dict]) -> str:
     lines = []
     for i, m in enumerate(emails[:5], 1):
         sender = m.get("from", [{}])
+        sender_name = "Неизвестно"
         if isinstance(sender, list) and sender:
             sender_name = sender[0].get("displayName") or sender[0].get("local", "Неизвестно")
-        else:
-            sender_name = "Неизвестно"
         subject = m.get("subject", "Без темы")[:40]
         lines.append(f"{i}. От {sender_name}: {subject}")
     return "Последние письма: " + ". ".join(lines)
-
-
-# ── Яндекс Логин ─────────────────────────────────────────────────────────────
-
-async def get_yandex_login(token: str) -> str | None:
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                "https://login.yandex.ru/info?format=json",
-                headers={"Authorization": f"OAuth {token}"}
-            )
-        if resp.status_code == 200:
-            login = resp.json().get("login")
-            print(f"LOGIN: {login}")
-            return login
-    except Exception as e:
-        print(f"LOGIN ERROR: {e}")
-    return None
-
-
-# ── Яндекс Календарь (CalDAV) ────────────────────────────────────────────────
-
-async def get_calendar_events(token: str, date_str: str) -> list[dict]:
-    try:
-        login = await get_yandex_login(token)
-        if not login:
-            return []
-
-        def fetch():
-            import caldav
-            cal_url = f"https://caldav.yandex.ru/calendars/{login}/events/"
-            print(f"CALDAV URL: {cal_url}")
-            client = caldav.DAVClient(url=cal_url, username=login, password=token)
-            cal = caldav.Calendar(client=client, url=cal_url)
-            start = datetime.fromisoformat(date_str)
-            end = start + timedelta(days=1)
-            events = cal.date_search(start=start, end=end, expand=True)
-            result = []
-            for e in events[:5]:
-                vevent = e.vobject_instance.vevent
-                summary = str(getattr(vevent, "summary", "Без названия").value)
-                dtstart = getattr(vevent, "dtstart", None)
-                t = ""
-                if dtstart and hasattr(dtstart.value, "strftime"):
-                    t = dtstart.value.strftime("%H:%M")
-                result.append({"name": summary, "time": t})
-            return result
-
-        result = await asyncio.get_event_loop().run_in_executor(None, fetch)
-        print(f"CALENDAR EVENTS: {result}")
-        return result
-
-    except Exception as e:
-        print(f"CALENDAR ERROR: {e}")
-        return []
-
-
-def format_events(events: list[dict], day_name: str) -> str:
-    if not events:
-        return f"{day_name} встреч нет. Свободен!"
-    lines = []
-    for e in events:
-        name = e.get("name", "Без названия")
-        t = e.get("time", "")
-        lines.append(f"{t} — {name}" if t else name)
-    return f"{day_name} у тебя: " + ", ".join(lines)
-
-
-async def create_calendar_event(token: str, title: str, time_str: str, date_str: str) -> bool:
-    try:
-        login = await get_yandex_login(token)
-        if not login:
-            return False
-
-        def create():
-            import caldav
-            cal_url = f"https://caldav.yandex.ru/calendars/{login}/events/"
-            print(f"CALDAV CREATE URL: {cal_url}")
-            client = caldav.DAVClient(url=cal_url, username=login, password=token)
-            cal = caldav.Calendar(client=client, url=cal_url)
-
-            hour, minute = 9, 0
-            if ":" in time_str:
-                parts = time_str.split(":")
-                hour = int(parts[0])
-                minute = int(parts[1]) if len(parts) > 1 else 0
-
-            start_dt = datetime.fromisoformat(date_str).replace(hour=hour, minute=minute)
-            end_dt = start_dt.replace(hour=min(hour + 1, 23))
-
-            ical = (
-                "BEGIN:VCALENDAR\r\n"
-                "VERSION:2.0\r\n"
-                "PRODID:-//Alice Assistant//RU\r\n"
-                "BEGIN:VEVENT\r\n"
-                f"UID:{uuid.uuid4()}@alice\r\n"
-                f"DTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}\r\n"
-                f"DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}\r\n"
-                f"DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}\r\n"
-                f"SUMMARY:{title}\r\n"
-                "END:VEVENT\r\n"
-                "END:VCALENDAR\r\n"
-            )
-            cal.save_event(ical)
-            return True
-
-        result = await asyncio.get_event_loop().run_in_executor(None, create)
-        print(f"CREATE EVENT RESULT: {result}")
-        return result
-
-    except Exception as e:
-        print(f"CREATE EVENT ERROR: {e}")
-        return False
 
 
 # ── Сессии ────────────────────────────────────────────────────────────────────
@@ -312,14 +346,13 @@ async def root():
 @app.post("/webhook")
 async def alice_webhook(request: Request):
     body = await request.json()
-    print("=== REQUEST ===")
-    print(json.dumps(body, ensure_ascii=False, indent=2))
 
     user_text: str = body.get("request", {}).get("original_utterance", "").strip()
     is_new_session: bool = body.get("session", {}).get("new", False)
     session_id: str = body.get("session", {}).get("session_id", "")
     user_token: str | None = body.get("session", {}).get("user", {}).get("access_token")
 
+    # ── Нет токена ────────────────────────────────────────────────────────────
     if not user_token:
         return {
             "response": {"text": "Для работы нужно войти в аккаунт Яндекса.", "end_session": False},
@@ -327,97 +360,106 @@ async def alice_webhook(request: Request):
             "version": "1.0"
         }
 
+    # ── Читаем персону при старте сессии ─────────────────────────────────────
     if is_new_session:
+        persona = await read_persona(user_token)
+        sessions[session_id] = {"persona": persona, "files": []}
+
+        if persona:
+            # Извлекаем имя из персоны если есть
+            greeting = "С возвращением! "
+            for line in persona.split("\n"):
+                if "имя" in line.lower() or "зовут" in line.lower():
+                    greeting = f"С возвращением! Я тебя помню. "
+                    break
+        else:
+            greeting = "Привет! Я твой ИИ-ассистент. Я буду запоминать твои предпочтения. "
+
         return _reply(
-            "Привет! Я твой ИИ-ассистент. Понимаю любые фразы. "
-            "Попробуй: покажи файлы, прочитай почту, что у меня сегодня, "
-            "или создай встречу совещание в 15:00."
+            greeting +
+            "Говори свободно — понимаю любые фразы. "
+            "Например: покажи файлы, прочитай почту, или просто задай вопрос."
         )
 
-    intent_data = await understand_intent(user_text)
+    # ── Получаем персону из сессии ────────────────────────────────────────────
+    persona = sessions.get(session_id, {}).get("persona")
+
+    # ── GPT определяет намерение ──────────────────────────────────────────────
+    intent_data = await understand_intent(user_text, persona)
     intent = intent_data.get("intent", "unknown")
     print(f"INTENT: {intent_data}")
+
+    reply_text = ""
+
+    # ── Обработка намерений ───────────────────────────────────────────────────
 
     if intent == "search_disk":
         query = intent_data.get("query", "").strip()
         if not query:
-            return _reply("Скажи название файла который ищешь.")
-        files = await search_disk(user_token, query)
-        sessions[session_id] = {"files": files}
-        if not files:
-            return _reply(f"Файлов с названием «{query}» не нашла.")
-        return _reply(format_files(files) + ". Назови номер чтобы получить ссылку.")
+            reply_text = "Скажи название файла который ищешь."
+        else:
+            files = await search_disk(user_token, query)
+            sessions[session_id]["files"] = files
+            if not files:
+                reply_text = f"Файлов с названием «{query}» не нашла."
+            else:
+                reply_text = format_files(files) + ". Назови номер чтобы получить ссылку."
 
     elif intent == "list_disk":
         files = await list_recent_files(user_token)
-        sessions[session_id] = {"files": files}
+        sessions[session_id]["files"] = files
         if not files:
-            return _reply("На диске файлов не нашла.")
-        return _reply(format_files(files) + ". Назови номер чтобы получить ссылку.")
+            reply_text = "На диске файлов не нашла."
+        else:
+            reply_text = format_files(files) + ". Назови номер чтобы получить ссылку."
 
     elif intent == "get_link":
         number = intent_data.get("number", 1)
         files = sessions.get(session_id, {}).get("files", [])
         if not files:
-            return _reply("Сначала скажи: покажи файлы.")
-        if number > len(files):
-            return _reply(f"У меня только {len(files)} файлов.")
-        file = files[number - 1]
-        name = file.get("name", "файл").rsplit(".", 1)[0]
-        link = await get_public_link(user_token, file.get("path", ""))
-        if link:
-            return _reply(f"Ссылка на «{name}»: {link}")
-        return _reply(f"Не смогла создать ссылку.")
+            reply_text = "Сначала скажи: покажи файлы."
+        elif number > len(files):
+            reply_text = f"У меня только {len(files)} файлов."
+        else:
+            file = files[number - 1]
+            name = file.get("name", "файл").rsplit(".", 1)[0]
+            link = await get_public_link(user_token, file.get("path", ""))
+            reply_text = f"Ссылка на «{name}»: {link}" if link else "Не смогла создать ссылку."
 
     elif intent == "read_mail":
         emails = await get_recent_emails(user_token)
-        if not emails:
-            return _reply("Не удалось получить письма.")
-        return _reply(format_emails(emails))
+        reply_text = format_emails(emails) if emails else "Не удалось получить письма."
 
     elif intent == "search_mail":
         sender = intent_data.get("sender", "")
         emails = await get_recent_emails(user_token)
         filtered = [e for e in emails if sender.lower() in str(e.get("from", "")).lower()]
-        if not filtered:
-            return _reply(f"Писем от {sender} не нашла.")
-        return _reply(format_emails(filtered))
+        reply_text = format_emails(filtered) if filtered else f"Писем от {sender} не нашла."
 
-    elif intent == "calendar_today":
-        today = date.today().isoformat()
-        events = await get_calendar_events(user_token, today)
-        return _reply(format_events(events, "Сегодня"))
-
-    elif intent == "calendar_tomorrow":
-        tomorrow = (date.today() + timedelta(days=1)).isoformat()
-        events = await get_calendar_events(user_token, tomorrow)
-        return _reply(format_events(events, "Завтра"))
-
-    elif intent == "create_event":
-        title = intent_data.get("title", "Встреча")
-        time_str = intent_data.get("time", "09:00")
-        today = date.today().isoformat()
-        success = await create_calendar_event(user_token, title, time_str, today)
-        if success:
-            return _reply(f"Создала событие «{title}» на {time_str}.")
-        return _reply("Не смогла создать событие.")
+    elif intent == "chat":
+        message = intent_data.get("message", user_text)
+        reply_text = await chat_with_gpt(message, persona)
 
     elif intent == "help":
-        return _reply(
-            "Я понимаю любые фразы. Попробуй: "
+        reply_text = (
+            "Говори свободно — я пойму. Например: "
             "покажи файлы на диске, найди документ отчёт, "
-            "прочитай почту, что у меня сегодня, "
-            "создай встречу совещание в 15:00."
+            "прочитай почту, или задай любой вопрос."
         )
 
     elif intent == "exit":
-        return _reply("До встречи!", end=True)
+        # Обновляем персону перед выходом
+        await update_persona(user_token, persona, user_text, "До встречи!")
+        return _reply("До встречи! Запомнила наш разговор.", end=True)
 
     else:
-        return _reply(
-            f"Не поняла: «{user_text}». "
-            "Попробуй: покажи файлы, прочитай почту, или что у меня сегодня."
-        )
+        reply_text = "Не поняла. Попробуй: покажи файлы, прочитай почту, или задай вопрос."
+
+    # ── Обновляем персону в фоне после каждого сообщения ─────────────────────
+    import asyncio
+    asyncio.create_task(update_persona(user_token, persona, user_text, reply_text))
+
+    return _reply(reply_text)
 
 
 def _reply(text: str, end: bool = False) -> dict:
