@@ -198,58 +198,138 @@ def format_emails(emails: list[dict]) -> str:
     return "Последние письма: " + ". ".join(lines)
 
 
-# ── Яндекс Календарь ─────────────────────────────────────────────────────────
+# ── Яндекс Календарь (CalDAV) ────────────────────────────────────────────────
 
-async def get_calendar_events(token: str, date_str: str) -> list[dict]:
-    """Получаем события из Яндекс Календаря на указанную дату"""
+async def get_yandex_login(token: str) -> str | None:
+    """Получаем логин пользователя по токену"""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
-                "https://calendar.yandex.ru/api/v1/events",
-                headers={"Authorization": f"OAuth {token}"},
-                params={
-                    "start": f"{date_str}T00:00:00",
-                    "end": f"{date_str}T23:59:59",
-                    "layers": "all"
-                }
+                "https://login.yandex.ru/info?format=json",
+                headers={"Authorization": f"OAuth {token}"}
             )
-        print(f"CALENDAR STATUS: {resp.status_code}")
         if resp.status_code == 200:
-            return resp.json().get("events", [])
+            return resp.json().get("login")
+    except Exception as e:
+        print(f"LOGIN ERROR: {e}")
+    return None
+
+
+async def get_calendar_events(token: str, date_str: str) -> list[dict]:
+    """Получаем события через CalDAV"""
+    import asyncio
+    try:
+        login = await get_yandex_login(token)
+        if not login:
+            print("CALENDAR: не удалось получить логин")
+            return []
+
+        # Запускаем CalDAV в отдельном потоке (библиотека синхронная)
+        def fetch_events():
+            import caldav
+            from datetime import datetime, timedelta
+            client = caldav.DAVClient(
+                url=f"https://caldav.yandex.ru/calendars/{login}/",
+                username=login,
+                password=token  # CalDAV принимает OAuth токен как пароль
+            )
+            principal = client.principal()
+            calendars = principal.calendars()
+            if not calendars:
+                return []
+
+            cal = calendars[0]
+            start = datetime.fromisoformat(date_str)
+            end = start + timedelta(days=1)
+            events = cal.date_search(start=start, end=end, expand=True)
+
+            result = []
+            for e in events[:5]:
+                vevent = e.vobject_instance.vevent
+                summary = str(getattr(vevent, "summary", "Без названия").value)
+                dtstart = getattr(vevent, "dtstart", None)
+                time_str = ""
+                if dtstart:
+                    dt = dtstart.value
+                    if hasattr(dt, "strftime"):
+                        time_str = dt.strftime("%H:%M")
+                result.append({"name": summary, "time": time_str})
+            return result
+
+        events = await asyncio.get_event_loop().run_in_executor(None, fetch_events)
+        print(f"CALENDAR EVENTS: {events}")
+        return events
+
     except Exception as e:
         print(f"CALENDAR ERROR: {e}")
-    return []
+        return []
 
 
 def format_events(events: list[dict], day_name: str) -> str:
     if not events:
         return f"{day_name} встреч нет. Свободен!"
     lines = []
-    for e in events[:5]:
+    for e in events:
         name = e.get("name", "Без названия")
-        start = e.get("start", "")
-        time = start[11:16] if len(start) > 15 else ""
+        time = e.get("time", "")
         lines.append(f"{time} — {name}" if time else name)
     return f"{day_name} у тебя: " + ", ".join(lines)
 
 
 async def create_calendar_event(token: str, title: str, time_str: str, date_str: str) -> bool:
-    """Создаём событие в Яндекс Календаре"""
+    """Создаём событие через CalDAV"""
+    import asyncio
     try:
-        payload = {
-            "name": title,
-            "start": f"{date_str}T{time_str}:00",
-            "end": f"{date_str}T{time_str}:00",
-            "duration": 3600
-        }
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://calendar.yandex.ru/api/v1/events",
-                headers={"Authorization": f"OAuth {token}", "Content-Type": "application/json"},
-                json=payload
+        login = await get_yandex_login(token)
+        if not login:
+            return False
+
+        def create_event():
+            import caldav
+            from datetime import datetime
+            import uuid
+
+            client = caldav.DAVClient(
+                url=f"https://caldav.yandex.ru/calendars/{login}/",
+                username=login,
+                password=token
             )
-        print(f"CREATE EVENT STATUS: {resp.status_code}")
-        return resp.status_code in (200, 201)
+            principal = client.principal()
+            calendars = principal.calendars()
+            if not calendars:
+                return False
+
+            cal = calendars[0]
+
+            # Парсим время
+            hour, minute = 9, 0
+            if ":" in time_str:
+                parts = time_str.split(":")
+                hour = int(parts[0])
+                minute = int(parts[1]) if len(parts) > 1 else 0
+
+            start_dt = datetime.fromisoformat(date_str).replace(hour=hour, minute=minute)
+            end_dt = start_dt.replace(hour=hour + 1)
+
+            ical = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Alice Assistant//RU
+BEGIN:VEVENT
+UID:{uuid.uuid4()}
+DTSTAMP:{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}
+DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}
+DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}
+SUMMARY:{title}
+END:VEVENT
+END:VCALENDAR"""
+
+            cal.save_event(ical)
+            return True
+
+        result = await asyncio.get_event_loop().run_in_executor(None, create_event)
+        print(f"CREATE EVENT RESULT: {result}")
+        return result
+
     except Exception as e:
         print(f"CREATE EVENT ERROR: {e}")
         return False
