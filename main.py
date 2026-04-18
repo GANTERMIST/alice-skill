@@ -354,15 +354,17 @@ async def alice_webhook(request: Request):
     user_text: str = body.get("request", {}).get("original_utterance", "").strip()
     is_new_session: bool = body.get("session", {}).get("new", False)
     session_id: str = body.get("session", {}).get("session_id", "")
-    user_token: str | None = body.get("session", {}).get("user", {}).get("access_token")
+    session_data = body.get("session", {})
+    user_token: str | None = session_data.get("user", {}).get("access_token")
 
     # ── Нет токена ────────────────────────────────────────────────────────────
     if not user_token:
-        return {
-            "response": {"text": "Для работы нужно войти в аккаунт Яндекса.", "end_session": False},
-            "start_account_linking": {},
-            "version": "1.0"
-        }
+        return _reply(
+            "Для работы нужно войти в аккаунт Яндекса.",
+            end=False,
+            session=session_data,
+            start_account_linking={}
+        )
 
     # ── Читаем персону при старте сессии ─────────────────────────────────────
     if is_new_session:
@@ -382,7 +384,8 @@ async def alice_webhook(request: Request):
         return _reply(
             greeting +
             "Говори свободно — понимаю любые фразы. "
-            "Например: покажи файлы, прочитай почту, или просто задай вопрос."
+            "Например: покажи файлы, прочитай почту, или просто задай вопрос.",
+            session=session_data
         )
 
     # ── Получаем персону — из сессии или с диска если сессия потеряна ────────
@@ -458,7 +461,7 @@ async def alice_webhook(request: Request):
     elif intent == "exit":
         # Обновляем персону перед выходом
         await update_persona(user_token, persona, user_text, "До встречи!")
-        return _reply("До встречи! Запомнила наш разговор.", end=True)
+        return _reply("До встречи! Запомнила наш разговор.", end=True, session=session_data)
 
     else:
         reply_text = "Не поняла. Попробуй: покажи файлы, прочитай почту, или задай вопрос."
@@ -468,11 +471,21 @@ async def alice_webhook(request: Request):
     if new_persona and session_id in sessions:
         sessions[session_id]["persona"] = new_persona
 
-    return _reply(reply_text)
+    return _reply(reply_text, session=session_data)
 
 
-def _reply(text: str, end: bool = False) -> dict:
-    return {"response": {"text": text, "end_session": end}, "version": "1.0"}
+def _reply(
+    text: str,
+    end: bool = False,
+    session: dict | None = None,
+    start_account_linking: dict | None = None,
+) -> dict:
+    response = {"response": {"text": text, "end_session": end}, "version": "1.0"}
+    if session is not None:
+        response["session"] = session
+    if start_account_linking is not None:
+        response["start_account_linking"] = start_account_linking
+    return response
 
 
 if __name__ == "__main__":
