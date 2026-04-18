@@ -382,8 +382,12 @@ async def alice_webhook(request: Request):
             "Например: покажи файлы, прочитай почту, или просто задай вопрос."
         )
 
-    # ── Получаем персону из сессии ────────────────────────────────────────────
-    persona = sessions.get(session_id, {}).get("persona")
+    # ── Получаем персону — из сессии или с диска если сессия потеряна ────────
+    if session_id not in sessions:
+        persona = await read_persona(user_token)
+        sessions[session_id] = {"persona": persona, "files": []}
+    else:
+        persona = sessions.get(session_id, {}).get("persona")
 
     # ── GPT определяет намерение ──────────────────────────────────────────────
     intent_data = await understand_intent(user_text, persona)
