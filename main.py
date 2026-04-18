@@ -38,9 +38,9 @@ async def read_persona(token: str) -> str | None:
         async with httpx.AsyncClient() as client:
             resp2 = await client.get(download_url)
 
-        content = resp2.text
+        content = resp2.text.strip()
         print(f"PERSONA READ: прочитано {len(content)} символов")
-        return content
+        return content if content else None  # пустой файл = нет персоны
 
     except Exception as e:
         print(f"PERSONA READ ERROR: {e}")
@@ -83,7 +83,7 @@ async def write_persona(token: str, content: str) -> bool:
         return False
 
 
-async def update_persona(token: str, old_persona: str | None, user_text: str, assistant_reply: str) -> None:
+async def update_persona(token: str, old_persona: str | None, user_text: str, assistant_reply: str) -> str | None:
     """Обновляем портрет пользователя через GPT после каждого сообщения"""
     old_text = old_persona or "Данных пока нет."
 
@@ -126,6 +126,7 @@ async def update_persona(token: str, old_persona: str | None, user_text: str, as
             new_persona = resp.json()["result"]["alternatives"][0]["message"]["text"]
             await write_persona(token, new_persona)
             print(f"PERSONA UPDATED: {new_persona[:100]}...")
+            return new_persona
     except Exception as e:
         print(f"PERSONA UPDATE ERROR: {e}")
 
@@ -455,9 +456,10 @@ async def alice_webhook(request: Request):
     else:
         reply_text = "Не поняла. Попробуй: покажи файлы, прочитай почту, или задай вопрос."
 
-    # ── Обновляем персону в фоне после каждого сообщения ─────────────────────
-    import asyncio
-    asyncio.create_task(update_persona(user_token, persona, user_text, reply_text))
+    # ── Обновляем персону синхронно и сохраняем в сессию ────────────────────
+    new_persona = await update_persona(user_token, persona, user_text, reply_text)
+    if new_persona and session_id in sessions:
+        sessions[session_id]["persona"] = new_persona
 
     return _reply(reply_text)
 
