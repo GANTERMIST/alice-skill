@@ -3,70 +3,77 @@ import uvicorn
 import httpx
 import json
 import os
-import base64
 from datetime import date, timedelta
 
 app = FastAPI()
 
 YANDEX_GPT_API_KEY = os.getenv("YANDEX_GPT_API_KEY")
 YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")
-PERSONA_FILENAME = "persona_alice.txt"
-PERSONA_DISK_PATH = f"disk:/{PERSONA_FILENAME}"
+PERSONA_PATH = "disk:/persona_alice.txt"
 
-# ── Persona — чтение и запись на Яндекс Диск ─────────────────────────────────
+# ── Persona — чтение и запись ─────────────────────────────────────────────────
 
-async def read_persona(token: str) -> str | None:
-    """Читаем файл persona_alice.txt с диска пользователя"""
+async def read_persona(token: str) -> dict:
+    """Читаем persona_alice.txt и возвращаем как словарь фактов"""
     headers = {"Authorization": f"OAuth {token}"}
     try:
-        # Получаем ссылку на скачивание
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 "https://cloud-api.yandex.net/v1/disk/resources/download",
                 headers=headers,
-                params={"path": PERSONA_DISK_PATH}
+                params={"path": PERSONA_PATH}
             )
         if resp.status_code != 200:
-            print(f"PERSONA READ: файл не найден ({resp.status_code})")
-            return None
+            print("PERSONA: файл не найден, создадим новый")
+            return {}
 
         download_url = resp.json().get("href")
-        if not download_url:
-            return None
-
-        # Скачиваем содержимое
         async with httpx.AsyncClient() as client:
             resp2 = await client.get(download_url)
 
         content = resp2.text.strip()
-        print(f"PERSONA READ: прочитано {len(content)} символов")
-        return content if content else None  # пустой файл = нет персоны
+        if not content:
+            return {}
+
+        # Парсим файл в словарь: "ключ: значение"
+        facts = {}
+        for line in content.split("\n"):
+            line = line.strip().lstrip("- ")
+            if ":" in line:
+                key, _, val = line.partition(":")
+                key = key.strip().lower()
+                val = val.strip()
+                if val and val.lower() != "неизвестно":
+                    facts[key] = val
+
+        print(f"PERSONA READ: {facts}")
+        return facts
 
     except Exception as e:
         print(f"PERSONA READ ERROR: {e}")
-        return None
+        return {}
 
 
-async def write_persona(token: str, content: str) -> bool:
-    """Записываем/обновляем файл persona_alice.txt на диске"""
+async def write_persona(token: str, facts: dict) -> bool:
+    """Записываем словарь фактов в persona_alice.txt"""
+    if not facts:
+        return True
+
+    lines = [f"- {k.capitalize()}: {v}" for k, v in facts.items()]
+    content = "\n".join(lines)
+
     headers = {"Authorization": f"OAuth {token}"}
     try:
-        # Получаем ссылку на загрузку (overwrite=true — перезапишет если есть)
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 "https://cloud-api.yandex.net/v1/disk/resources/upload",
                 headers=headers,
-                params={"path": PERSONA_DISK_PATH, "overwrite": "true"}
+                params={"path": PERSONA_PATH, "overwrite": "true"}
             )
         if resp.status_code != 200:
-            print(f"PERSONA WRITE: не удалось получить URL ({resp.status_code})")
             return False
 
         upload_url = resp.json().get("href")
-        if not upload_url:
-            return False
-
-        # Загружаем файл
         async with httpx.AsyncClient() as client:
             resp2 = await client.put(
                 upload_url,
@@ -74,36 +81,57 @@ async def write_persona(token: str, content: str) -> bool:
                 headers={"Content-Type": "text/plain; charset=utf-8"}
             )
 
-        success = resp2.status_code in (200, 201)
-        print(f"PERSONA WRITE: {'успешно' if success else 'ошибка ' + str(resp2.status_code)}")
-        return success
+        ok = resp2.status_code in (200, 201)
+        print(f"PERSONA WRITE: {'OK' if ok else 'FAIL ' + str(resp2.status_code)}")
+        return ok
 
     except Exception as e:
         print(f"PERSONA WRITE ERROR: {e}")
         return False
 
 
-async def update_persona(token: str, old_persona: str | None, user_text: str, assistant_reply: str) -> str | None:
-    """Обновляем портрет пользователя через GPT после каждого сообщения"""
-    old_text = old_persona or "Данных пока нет."
+async def extract_facts_with_gpt(user_text: str, existing: dict) -> dict:
+    """
+    GPT анализирует сообщение и возвращает изменения к персоне.
+    Три операции: add (добавить), update (заменить), delete (удалить).
+    Код применяет изменения к существующим данным.
+    """
+    if not user_text.strip():
+        return existing
 
-    prompt = f"""Ты — система ведения портрета пользователя.
+    existing_str = json.dumps(existing, ensure_ascii=False) if existing else "{}"
 
-ТЕКУЩИЙ ПОРТРЕТ (сохрани ВСЕ эти данные без изменений):
-{old_text}
+    prompt = f"""Ты — интеллектуальная система ведения профиля пользователя.
 
-Последний диалог:
-Пользователь: "{user_text}"
-Ассистент: "{assistant_reply}"
+Текущий профиль пользователя:
+{existing_str}
 
-ПРАВИЛА:
-1. Скопируй ВЕСЬ текущий портрет полностью — не удаляй ни одной строки
-2. Если в диалоге появились НОВЫЕ факты которых нет в портрете — добавь их
-3. Если новых фактов нет — верни портрет без изменений
-4. Не заменяй известные данные на "неизвестно"
-5. Верни ТОЛЬКО итоговый портрет, без пояснений
+Новое сообщение от пользователя: "{user_text}"
 
-Итоговый портрет:"""
+Проанализируй сообщение и определи какие изменения нужно внести в профиль.
+Верни JSON со структурой:
+{{
+  "add": {{}},     <- новые факты которых не было
+  "update": {{}},  <- факты которые изменились (старое значение заменяется новым)
+  "delete": []     <- ключи фактов которые нужно удалить
+}}
+
+Правила:
+- add: используй если факт совсем новый
+- update: используй если пользователь говорит что что-то изменилось ("теперь", "уже не", "перешёл", "уволился", "переехал", "мне теперь")
+- delete: используй если пользователь явно говорит забыть/удалить факт
+- Если в сообщении нет информации о пользователе — верни {{"add": {{}}, "update": {{}}, "delete": []}}
+- Ключи в нижнем регистре через подчёркивание: имя, возраст, место_работы, учёба, город, статус, интересы
+
+Примеры:
+"меня зовут Артём" (имя неизвестно) -> {{"add": {{"имя": "Артём"}}, "update": {{}}, "delete": []}}
+"теперь работаю в Яндексе" (было: Гугл) -> {{"add": {{}}, "update": {{"место_работы": "Яндекс"}}, "delete": []}}
+"переехал в Москву" -> {{"add": {{}}, "update": {{"город": "Москва"}}, "delete": []}}
+"я больше не студент, я разработчик" -> {{"add": {{}}, "update": {{"статус": "разработчик"}}, "delete": ["учёба"]}}
+"забудь мой возраст" -> {{"add": {{}}, "update": {{}}, "delete": ["возраст"]}}
+"покажи файлы" -> {{"add": {{}}, "update": {{}}, "delete": []}}
+
+Верни ТОЛЬКО JSON:"""
 
     headers = {
         "Authorization": f"Api-Key {YANDEX_GPT_API_KEY}",
@@ -111,59 +139,84 @@ async def update_persona(token: str, old_persona: str | None, user_text: str, as
     }
     payload = {
         "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite",
-        "completionOptions": {"stream": False, "temperature": 0.3, "maxTokens": 300},
+        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 200},
         "messages": [{"role": "user", "text": prompt}]
     }
 
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(
                 "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
                 headers=headers, json=payload
             )
-        if resp.status_code == 200:
-            new_persona = resp.json()["result"]["alternatives"][0]["message"]["text"].strip()
-            # Защита: если новый портрет короче старого — GPT что-то удалил, оставляем старый
-            if old_persona and len(new_persona) < len(old_persona) * 0.7:
-                print(f"PERSONA PROTECTION: новый портрет короче старого, сохраняем старый")
-                return old_persona
-            await write_persona(token, new_persona)
-            print(f"PERSONA UPDATED: {new_persona[:100]}...")
-            return new_persona
+        if resp.status_code != 200:
+            return existing
+
+        text = resp.json()["result"]["alternatives"][0]["message"]["text"]
+        text = text.strip().replace("```json", "").replace("```", "").strip()
+        changes = json.loads(text)
+
+        if not isinstance(changes, dict):
+            return existing
+
+        add = changes.get("add", {})
+        update = changes.get("update", {})
+        delete = changes.get("delete", [])
+
+        # Нет изменений — возвращаем как есть
+        if not add and not update and not delete:
+            return existing
+
+        # Применяем изменения к копии существующих данных
+        merged = dict(existing)
+
+        for key, val in add.items():
+            if key not in merged:  # добавляем только если нет
+                merged[key] = val
+
+        for key, val in update.items():
+            merged[key] = val  # заменяем значение
+
+        for key in delete:
+            merged.pop(key, None)  # удаляем факт
+
+        print(f"PERSONA CHANGES — add:{add} update:{update} delete:{delete}")
+        return merged
+
     except Exception as e:
-        print(f"PERSONA UPDATE ERROR: {e}")
+        print(f"PERSONA EXTRACT ERROR: {e}")
+
+    return existing
 
 
-# ── YandexGPT — понимание намерений ──────────────────────────────────────────
+# ── YandexGPT ────────────────────────────────────────────────────────────────
 
-async def understand_intent(user_text: str, persona: str | None) -> dict:
-    persona_context = f"\nКонтекст о пользователе:\n{persona}\n" if persona else ""
+async def understand_intent(user_text: str, persona: dict) -> dict:
+    persona_lines = "\n".join(f"- {k}: {v}" for k, v in persona.items())
+    persona_context = f"\nЧто известно о пользователе:\n{persona_lines}\n" if persona else ""
 
     prompt = f"""Ты — анализатор команд для голосового ассистента.{persona_context}
 Пользователь сказал: "{user_text}"
 
-Определи намерение и верни ТОЛЬКО JSON без пояснений:
+Определи намерение и верни ТОЛЬКО JSON без пояснений.
 
 Возможные intent:
-- search_disk — поиск файла на диске (нужен параметр "query")
-- list_disk — показать последние файлы на диске
-- get_link — получить ссылку на файл по номеру (нужен параметр "number" от 1 до 5)
-- read_mail — прочитать последние письма
-- search_mail — найти письма от отправителя (нужен параметр "sender")
-- chat — просто поговорить или задать вопрос (нужен параметр "message")
+- search_disk — поиск файла (параметр "query")
+- list_disk — показать последние файлы
+- get_link — ссылка на файл по номеру (параметр "number")
+- read_mail — прочитать письма
+- search_mail — письма от отправителя (параметр "sender")
+- chat — разговор или вопрос (параметр "message")
 - help — помощь
 - exit — выход
-- unknown — непонятная команда
 
 Примеры:
 "найди файл отчёт" -> {{"intent": "search_disk", "query": "отчёт"}}
-"покажи документ про бюджет" -> {{"intent": "search_disk", "query": "бюджет"}}
 "последние файлы" -> {{"intent": "list_disk"}}
 "дай ссылку на первый" -> {{"intent": "get_link", "number": 1}}
 "прочитай почту" -> {{"intent": "read_mail"}}
-"письма от Иванова" -> {{"intent": "search_mail", "sender": "Иванов"}}
-"как дела" -> {{"intent": "chat", "message": "как дела"}}
-"что такое машинное обучение" -> {{"intent": "chat", "message": "что такое машинное обучение"}}
+"как меня зовут" -> {{"intent": "chat", "message": "как меня зовут"}}
+"привет" -> {{"intent": "chat", "message": "привет"}}
 "пока" -> {{"intent": "exit"}}
 
 Верни ТОЛЬКО JSON:"""
@@ -189,19 +242,19 @@ async def understand_intent(user_text: str, persona: str | None) -> dict:
             text = text.strip().replace("```json", "").replace("```", "").strip()
             return json.loads(text)
     except Exception as e:
-        print(f"GPT ERROR: {e}")
+        print(f"GPT INTENT ERROR: {e}")
 
     return fallback_intent(user_text)
 
 
-async def chat_with_gpt(message: str, persona: str | None) -> str:
-    """Свободный разговор с GPT с учётом портрета пользователя"""
-    persona_block = f"Информация о пользователе:\n{persona}\n\n" if persona else ""
+async def chat_with_gpt(message: str, persona: dict) -> str:
+    """Свободный разговор с учётом персоны"""
+    persona_lines = "\n".join(f"- {k}: {v}" for k, v in persona.items())
+    persona_block = f"Что ты знаешь о пользователе:\n{persona_lines}\n\n" if persona else ""
 
     system = (
-        f"Ты — голосовой ассистент Алиса для корпоративного использования. "
-        f"Отвечай кратко и по делу — ответ будет озвучен голосом. "
-        f"Максимум 2-3 предложения.\n{persona_block}"
+        f"Ты — голосовой ассистент. Отвечай кратко — максимум 2 предложения. "
+        f"Ответ будет озвучен голосом.\n{persona_block}"
     )
 
     headers = {
@@ -224,9 +277,9 @@ async def chat_with_gpt(message: str, persona: str | None) -> str:
                 headers=headers, json=payload
             )
         if resp.status_code == 200:
-            return resp.json()["result"]["alternatives"][0]["message"]["text"]
+            return resp.json()["result"]["alternatives"][0]["message"]["text"].strip()
     except Exception as e:
-        print(f"CHAT GPT ERROR: {e}")
+        print(f"GPT CHAT ERROR: {e}")
 
     return "Не смогла ответить на этот вопрос."
 
@@ -235,7 +288,7 @@ def fallback_intent(text: str) -> dict:
     t = text.lower()
     if any(w in t for w in ["найди", "поищи", "найти"]):
         query = t
-        for w in ["найди", "поищи", "найти", "файл", "документ", "диск"]:
+        for w in ["найди", "поищи", "найти", "файл", "документ"]:
             query = query.replace(w, "")
         return {"intent": "search_disk", "query": query.strip()}
     if any(w in t for w in ["последн", "недавн", "все файлы"]):
@@ -342,9 +395,201 @@ sessions: dict[str, dict] = {}
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
+from fastapi.responses import HTMLResponse
+
 @app.get("/")
 async def root():
     return {"status": "ok"}
+
+
+@app.get("/persona", response_class=HTMLResponse)
+async def persona_page():
+    """Страница управления персоной пользователя"""
+    html = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Управление персоной</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, sans-serif; background: #f5f5f5; min-height: 100vh; padding: 20px; }
+  .container { max-width: 600px; margin: 0 auto; }
+  h1 { font-size: 24px; margin-bottom: 8px; color: #111; }
+  p.sub { color: #666; margin-bottom: 24px; font-size: 14px; }
+  .card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-bottom: 16px; }
+  .step { font-size: 13px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+  input[type=text] { width: 100%; padding: 10px 14px; border: 1.5px solid #e0e0e0; border-radius: 8px; font-size: 15px; outline: none; transition: border 0.2s; }
+  input[type=text]:focus { border-color: #FC3F1D; }
+  textarea { width: 100%; height: 200px; padding: 12px 14px; border: 1.5px solid #e0e0e0; border-radius: 8px; font-size: 14px; font-family: monospace; resize: vertical; outline: none; transition: border 0.2s; }
+  textarea:focus { border-color: #FC3F1D; }
+  button { background: #FC3F1D; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; width: 100%; margin-top: 12px; transition: opacity 0.2s; }
+  button:hover { opacity: 0.85; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .msg { margin-top: 12px; padding: 10px 14px; border-radius: 8px; font-size: 14px; display: none; }
+  .msg.ok { background: #e8f5e9; color: #2e7d32; display: block; }
+  .msg.err { background: #ffebee; color: #c62828; display: block; }
+  .hint { font-size: 13px; color: #888; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🤖 Управление персоной</h1>
+  <p class="sub">Здесь можно посмотреть и отредактировать что ассистент знает о вас</p>
+
+  <div class="card">
+    <div class="step">Шаг 1 — введите ваш OAuth токен</div>
+    <input type="text" id="token" placeholder="y0_AgAAAA..." />
+    <p class="hint">Получить токен: откройте в браузере →
+      <a href="https://oauth.yandex.ru/authorize?response_type=token&client_id=807ee186b02f460192b31c5394e685b2" target="_blank">получить токен</a>
+      и скопируйте из адресной строки после access_token=
+    </p>
+    <button onclick="loadPersona()">Загрузить мою персону</button>
+    <div id="load-msg" class="msg"></div>
+  </div>
+
+  <div class="card" id="edit-card" style="display:none">
+    <div class="step">Шаг 2 — редактируйте и сохраняйте</div>
+    <textarea id="persona-text"></textarea>
+    <p class="hint">Каждая строка: "- ключ: значение". Удалите строку чтобы убрать факт.</p>
+    <button onclick="savePersona()">💾 Сохранить изменения</button>
+    <div id="save-msg" class="msg"></div>
+  </div>
+</div>
+
+<script>
+let currentToken = '';
+
+async function loadPersona() {
+  const token = document.getElementById('token').value.trim();
+  if (!token) { showMsg('load-msg', 'Введите токен', false); return; }
+  currentToken = token;
+
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Загружаю...';
+
+  try {
+    const r = await fetch('/persona/load', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token})
+    });
+    const data = await r.json();
+    if (data.content !== undefined) {
+      document.getElementById('persona-text').value = data.content || '(файл пуст)';
+      document.getElementById('edit-card').style.display = 'block';
+      showMsg('load-msg', 'Персона загружена!', true);
+    } else {
+      showMsg('load-msg', data.error || 'Ошибка загрузки', false);
+    }
+  } catch(e) {
+    showMsg('load-msg', 'Ошибка: ' + e.message, false);
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Загрузить мою персону';
+}
+
+async function savePersona() {
+  const content = document.getElementById('persona-text').value.trim();
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Сохраняю...';
+
+  try {
+    const r = await fetch('/persona/save', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token: currentToken, content})
+    });
+    const data = await r.json();
+    if (data.ok) {
+      showMsg('save-msg', 'Сохранено! Ассистент учтёт изменения при следующем запуске.', true);
+    } else {
+      showMsg('save-msg', data.error || 'Ошибка сохранения', false);
+    }
+  } catch(e) {
+    showMsg('save-msg', 'Ошибка: ' + e.message, false);
+  }
+
+  btn.disabled = false;
+  btn.textContent = '💾 Сохранить изменения';
+}
+
+function showMsg(id, text, ok) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+}
+</script>
+</body>
+</html>"""
+    return html
+
+
+@app.post("/persona/load")
+async def persona_load(request: Request):
+    """Загружаем содержимое файла персоны"""
+    body = await request.json()
+    token = body.get("token", "")
+    if not token:
+        return {"error": "Токен не указан"}
+
+    headers = {"Authorization": f"OAuth {token}"}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://cloud-api.yandex.net/v1/disk/resources/download",
+                headers=headers,
+                params={"path": PERSONA_PATH}
+            )
+        if resp.status_code == 404:
+            return {"content": ""}
+        if resp.status_code != 200:
+            return {"error": f"Ошибка доступа к диску: {resp.status_code}"}
+
+        download_url = resp.json().get("href")
+        async with httpx.AsyncClient() as client:
+            resp2 = await client.get(download_url)
+        return {"content": resp2.text.strip()}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/persona/save")
+async def persona_save(request: Request):
+    """Сохраняем отредактированный файл персоны"""
+    body = await request.json()
+    token = body.get("token", "")
+    content = body.get("content", "")
+
+    if not token:
+        return {"ok": False, "error": "Токен не указан"}
+
+    headers = {"Authorization": f"OAuth {token}"}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://cloud-api.yandex.net/v1/disk/resources/upload",
+                headers=headers,
+                params={"path": PERSONA_PATH, "overwrite": "true"}
+            )
+        if resp.status_code != 200:
+            return {"ok": False, "error": f"Ошибка: {resp.status_code}"}
+
+        upload_url = resp.json().get("href")
+        async with httpx.AsyncClient() as client:
+            resp2 = await client.put(
+                upload_url,
+                content=content.encode("utf-8"),
+                headers={"Content-Type": "text/plain; charset=utf-8"}
+            )
+        return {"ok": resp2.status_code in (200, 201)}
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.post("/webhook")
@@ -354,46 +599,38 @@ async def alice_webhook(request: Request):
     user_text: str = body.get("request", {}).get("original_utterance", "").strip()
     is_new_session: bool = body.get("session", {}).get("new", False)
     session_id: str = body.get("session", {}).get("session_id", "")
-    session_data = body.get("session", {})
-    user_token: str | None = session_data.get("user", {}).get("access_token")
+    user_token: str | None = body.get("session", {}).get("user", {}).get("access_token")
 
-    # ── Нет токена ────────────────────────────────────────────────────────────
     if not user_token:
-        return _reply(
-            "Для работы нужно войти в аккаунт Яндекса.",
-            end=False,
-            session=session_data,
-            start_account_linking={}
-        )
+        return {
+            "response": {"text": "Для работы нужно войти в аккаунт Яндекса.", "end_session": False},
+            "start_account_linking": {},
+            "version": "1.0"
+        }
 
-    # ── Читаем персону при старте сессии ─────────────────────────────────────
-    if is_new_session:
-        persona = await read_persona(user_token)
-        sessions[session_id] = {"persona": persona, "files": []}
-
-        if persona:
-            # Извлекаем имя из персоны если есть
-            greeting = "С возвращением! "
-            for line in persona.split("\n"):
-                if "имя" in line.lower() or "зовут" in line.lower():
-                    greeting = f"С возвращением! Я тебя помню. "
-                    break
-        else:
-            greeting = "Привет! Я твой ИИ-ассистент. Я буду запоминать твои предпочтения. "
-
-        return _reply(
-            greeting +
-            "Говори свободно — понимаю любые фразы. "
-            "Например: покажи файлы, прочитай почту, или просто задай вопрос.",
-            session=session_data
-        )
-
-    # ── Получаем персону — из сессии или с диска если сессия потеряна ────────
+    # ── Загружаем персону (при новой сессии или если нет в памяти) ────────────
     if session_id not in sessions:
         persona = await read_persona(user_token)
         sessions[session_id] = {"persona": persona, "files": []}
-    else:
-        persona = sessions.get(session_id, {}).get("persona")
+
+    persona: dict = sessions[session_id]["persona"]
+
+    # ── Новая сессия — приветствие ────────────────────────────────────────────
+    if is_new_session:
+        name = persona.get("имя", "")
+        if name:
+            greeting = f"С возвращением, {name}! Чем помочь?"
+        else:
+            greeting = "Привет! Я твой ассистент. Говори свободно — пойму любую фразу."
+        return _reply(greeting)
+
+    # ── Извлекаем факты из сообщения напрямую (без GPT) ──────────────────────
+    updated_persona = await extract_facts_with_gpt(user_text, persona)
+    if updated_persona != persona:
+        sessions[session_id]["persona"] = updated_persona
+        await write_persona(user_token, updated_persona)
+        print(f"PERSONA UPDATED: {updated_persona}")
+        persona = updated_persona
 
     # ── GPT определяет намерение ──────────────────────────────────────────────
     intent_data = await understand_intent(user_text, persona)
@@ -402,8 +639,6 @@ async def alice_webhook(request: Request):
 
     reply_text = ""
 
-    # ── Обработка намерений ───────────────────────────────────────────────────
-
     if intent == "search_disk":
         query = intent_data.get("query", "").strip()
         if not query:
@@ -411,22 +646,16 @@ async def alice_webhook(request: Request):
         else:
             files = await search_disk(user_token, query)
             sessions[session_id]["files"] = files
-            if not files:
-                reply_text = f"Файлов с названием «{query}» не нашла."
-            else:
-                reply_text = format_files(files) + ". Назови номер чтобы получить ссылку."
+            reply_text = (format_files(files) + ". Назови номер чтобы получить ссылку.") if files else f"Файлов «{query}» не нашла."
 
     elif intent == "list_disk":
         files = await list_recent_files(user_token)
         sessions[session_id]["files"] = files
-        if not files:
-            reply_text = "На диске файлов не нашла."
-        else:
-            reply_text = format_files(files) + ". Назови номер чтобы получить ссылку."
+        reply_text = (format_files(files) + ". Назови номер чтобы получить ссылку.") if files else "На диске файлов не нашла."
 
     elif intent == "get_link":
         number = intent_data.get("number", 1)
-        files = sessions.get(session_id, {}).get("files", [])
+        files = sessions[session_id].get("files", [])
         if not files:
             reply_text = "Сначала скажи: покажи файлы."
         elif number > len(files):
@@ -439,7 +668,7 @@ async def alice_webhook(request: Request):
 
     elif intent == "read_mail":
         emails = await get_recent_emails(user_token)
-        reply_text = format_emails(emails) if emails else "Не удалось получить письма."
+        reply_text = format_emails(emails)
 
     elif intent == "search_mail":
         sender = intent_data.get("sender", "")
@@ -452,40 +681,19 @@ async def alice_webhook(request: Request):
         reply_text = await chat_with_gpt(message, persona)
 
     elif intent == "help":
-        reply_text = (
-            "Говори свободно — я пойму. Например: "
-            "покажи файлы на диске, найди документ отчёт, "
-            "прочитай почту, или задай любой вопрос."
-        )
+        reply_text = "Говори свободно. Например: покажи файлы, прочитай почту, или задай любой вопрос."
 
     elif intent == "exit":
-        # Обновляем персону перед выходом
-        await update_persona(user_token, persona, user_text, "До встречи!")
-        return _reply("До встречи! Запомнила наш разговор.", end=True, session=session_data)
+        return _reply("До встречи!", end=True)
 
     else:
         reply_text = "Не поняла. Попробуй: покажи файлы, прочитай почту, или задай вопрос."
 
-    # ── Обновляем персону синхронно и сохраняем в сессию ────────────────────
-    new_persona = await update_persona(user_token, persona, user_text, reply_text)
-    if new_persona and session_id in sessions:
-        sessions[session_id]["persona"] = new_persona
-
-    return _reply(reply_text, session=session_data)
+    return _reply(reply_text)
 
 
-def _reply(
-    text: str,
-    end: bool = False,
-    session: dict | None = None,
-    start_account_linking: dict | None = None,
-) -> dict:
-    response = {"response": {"text": text, "end_session": end}, "version": "1.0"}
-    if session is not None:
-        response["session"] = session
-    if start_account_linking is not None:
-        response["start_account_linking"] = start_account_linking
-    return response
+def _reply(text: str, end: bool = False) -> dict:
+    return {"response": {"text": text, "end_session": end}, "version": "1.0"}
 
 
 if __name__ == "__main__":
