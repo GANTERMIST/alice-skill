@@ -54,10 +54,14 @@ async def read_persona(token: str) -> dict:
         return {}
 
 
-async def write_persona(token: str, facts: dict) -> bool:
+async def write_persona(token: str, facts: dict, existing: dict | None = None) -> bool:
     """Записываем словарь фактов в persona_alice.txt"""
     if not facts:
         return True
+    # Защита: не записываем если новых данных меньше чем было (что-то пошло не так)
+    if existing and len(facts) < len(existing):
+        print(f"PERSONA WRITE BLOCKED: попытка записать {len(facts)} фактов вместо {len(existing)}")
+        return False
 
     lines = [f"- {k.capitalize()}: {v}" for k, v in facts.items()]
     content = "\n".join(lines)
@@ -92,44 +96,54 @@ async def write_persona(token: str, facts: dict) -> bool:
 
 async def extract_facts_with_gpt(user_text: str, existing: dict) -> dict:
     """
-    GPT анализирует сообщение и возвращает изменения к персоне.
-    Три операции: add (добавить), update (заменить), delete (удалить).
-    Код применяет изменения к существующим данным.
+    GPT извлекает факты о пользователе из сообщения.
+    Только ADD и UPDATE — данные никогда не удаляются автоматически.
+    Удаление только по явным ключевым словам ("забудь", "удали").
     """
     if not user_text.strip():
         return existing
 
+    # Явное удаление по ключевым словам — обрабатываем без GPT
+    text_lower = user_text.lower()
+    if any(w in text_lower for w in ["забудь", "удали", "не запоминай", "сотри"]):
+        merged = dict(existing)
+        # Ищем какой именно факт удалить
+        for key in list(existing.keys()):
+            if key in text_lower:
+                merged.pop(key, None)
+                print(f"PERSONA DELETE (explicit): {key}")
+        if merged != existing:
+            return merged
+        # Если не поняли что именно удалять — оставляем как есть
+        return existing
+
     existing_str = json.dumps(existing, ensure_ascii=False) if existing else "{}"
 
-    prompt = f"""Ты — интеллектуальная система ведения профиля пользователя.
+    prompt = f"""Ты — система извлечения фактов о пользователе для голосового ассистента.
 
-Текущий профиль пользователя:
-{existing_str}
+Текущий профиль: {existing_str}
+Сообщение пользователя: "{user_text}"
 
-Новое сообщение от пользователя: "{user_text}"
-
-Проанализируй сообщение и определи какие изменения нужно внести в профиль.
-Верни JSON со структурой:
-{{
-  "add": {{}},     <- новые факты которых не было
-  "update": {{}},  <- факты которые изменились (старое значение заменяется новым)
-  "delete": []     <- ключи фактов которые нужно удалить
-}}
+Найди в сообщении факты о САМОМ пользователе (имя, возраст, работа, учёба, город и т.д.).
+Верни JSON с двумя полями:
+- "add": новые факты которых нет в профиле
+- "update": факты которые изменились (пользователь говорит что что-то поменялось)
 
 Правила:
-- add: используй если факт совсем новый
-- update: используй если пользователь говорит что что-то изменилось ("теперь", "уже не", "перешёл", "уволился", "переехал", "мне теперь")
-- delete: используй если пользователь явно говорит забыть/удалить факт
-- Если в сообщении нет информации о пользователе — верни {{"add": {{}}, "update": {{}}, "delete": []}}
-- Ключи в нижнем регистре через подчёркивание: имя, возраст, место_работы, учёба, город, статус, интересы
+1. Не удаляй и не трогай факты которые не упоминаются в сообщении
+2. "add" — только если этого ключа нет в текущем профиле
+3. "update" — только если пользователь явно говорит об изменении ("теперь", "уже", "переехал", "уволился", "перешёл")
+4. Если фактов нет — верни {{"add": {{}}, "update": {{}}}}
+5. Ключи строго в нижнем регистре через подчёркивание
 
 Примеры:
-"меня зовут Артём" (имя неизвестно) -> {{"add": {{"имя": "Артём"}}, "update": {{}}, "delete": []}}
-"теперь работаю в Яндексе" (было: Гугл) -> {{"add": {{}}, "update": {{"место_работы": "Яндекс"}}, "delete": []}}
-"переехал в Москву" -> {{"add": {{}}, "update": {{"город": "Москва"}}, "delete": []}}
-"я больше не студент, я разработчик" -> {{"add": {{}}, "update": {{"статус": "разработчик"}}, "delete": ["учёба"]}}
-"забудь мой возраст" -> {{"add": {{}}, "update": {{}}, "delete": ["возраст"]}}
-"покажи файлы" -> {{"add": {{}}, "update": {{}}, "delete": []}}
+"меня зовут Артём" → {{"add": {{"имя": "Артём"}}, "update": {{}}}}
+"я студент" → {{"add": {{"статус": "студент"}}, "update": {{}}}}
+"теперь работаю в Яндексе" → {{"add": {{}}, "update": {{"место_работы": "Яндекс"}}}}
+"мне 21 год" → {{"add": {{"возраст": "21 год"}}, "update": {{}}}}
+"переехал в Москву" → {{"add": {{}}, "update": {{"город": "Москва"}}}}
+"привет как дела" → {{"add": {{}}, "update": {{}}}}
+"покажи файлы" → {{"add": {{}}, "update": {{}}}}
 
 Верни ТОЛЬКО JSON:"""
 
@@ -139,7 +153,7 @@ async def extract_facts_with_gpt(user_text: str, existing: dict) -> dict:
     }
     payload = {
         "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite",
-        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 200},
+        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 150},
         "messages": [{"role": "user", "text": prompt}]
     }
 
@@ -152,40 +166,43 @@ async def extract_facts_with_gpt(user_text: str, existing: dict) -> dict:
         if resp.status_code != 200:
             return existing
 
-        text = resp.json()["result"]["alternatives"][0]["message"]["text"]
-        text = text.strip().replace("```json", "").replace("```", "").strip()
-        changes = json.loads(text)
+        raw = resp.json()["result"]["alternatives"][0]["message"]["text"]
+        raw = raw.strip().replace("```json", "").replace("```", "").strip()
+        changes = json.loads(raw)
 
         if not isinstance(changes, dict):
             return existing
 
         add = changes.get("add", {})
         update = changes.get("update", {})
-        delete = changes.get("delete", [])
 
-        # Нет изменений — возвращаем как есть
-        if not add and not update and not delete:
+        # Нет изменений — возвращаем существующие данные без изменений
+        if not add and not update:
             return existing
 
-        # Применяем изменения к копии существующих данных
-        merged = dict(existing)
+        # Безопасный мерж: копируем ВСЕ старые факты и добавляем/обновляем новые
+        merged = dict(existing)  # полная копия — ничего не теряем
 
         for key, val in add.items():
-            if key not in merged:  # добавляем только если нет
-                merged[key] = val
+            if key and val and key not in merged:  # добавляем только если нет
+                merged[key] = str(val).strip()
 
         for key, val in update.items():
-            merged[key] = val  # заменяем значение
+            if key and val and key in existing:  # обновляем только существующие ключи
+                merged[key] = str(val).strip()
 
-        for key in delete:
-            merged.pop(key, None)  # удаляем факт
+        # Финальная проверка: merged должен содержать ВСЕ ключи из existing
+        for key in existing:
+            if key not in merged:
+                merged[key] = existing[key]  # восстанавливаем если что-то потерялось
 
-        print(f"PERSONA CHANGES — add:{add} update:{update} delete:{delete}")
+        print(f"PERSONA CHANGES — add:{add} update:{update}")
         return merged
 
     except Exception as e:
         print(f"PERSONA EXTRACT ERROR: {e}")
 
+    # При любой ошибке возвращаем старые данные нетронутыми
     return existing
 
 
@@ -618,17 +635,18 @@ async def alice_webhook(request: Request):
     # ── Новая сессия — приветствие ────────────────────────────────────────────
     if is_new_session:
         name = persona.get("имя", "")
-        if name:
-            greeting = f"С возвращением, {name}! Чем помочь?"
-        else:
-            greeting = "Привет! Я твой ассистент. Говори свободно — пойму любую фразу."
+        greeting = f"С возвращением, {name}! Чем помочь?" if name else "Привет! Я твой ассистент. Говори свободно — пойму любую фразу."
         return _reply(greeting)
 
-    # ── Извлекаем факты из сообщения напрямую (без GPT) ──────────────────────
+    # ── Сервер перезапустился — сессия потеряна, но сообщение уже идёт ────────
+    # message_id > 0 и new=false означает что сессия была но сервер перезапустился
+    # Просто продолжаем с загруженной персоной, не прерываем диалог
+
+    # ── GPT извлекает факты из сообщения и обновляет персону ───────────────────
     updated_persona = await extract_facts_with_gpt(user_text, persona)
     if updated_persona != persona:
         sessions[session_id]["persona"] = updated_persona
-        await write_persona(user_token, updated_persona)
+        await write_persona(user_token, updated_persona, persona)
         print(f"PERSONA UPDATED: {updated_persona}")
         persona = updated_persona
 
@@ -688,6 +706,11 @@ async def alice_webhook(request: Request):
 
     else:
         reply_text = "Не поняла. Попробуй: покажи файлы, прочитай почту, или задай вопрос."
+
+    # Гарантируем что ответ никогда не пустой
+    if not reply_text.strip():
+        name = persona.get("имя", "")
+        reply_text = f"Слушаю, {name}! Чем помочь?" if name else "Слушаю! Чем помочь?"
 
     return _reply(reply_text)
 
