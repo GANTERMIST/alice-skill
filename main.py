@@ -66,8 +66,9 @@ async def read_persona(token: str) -> dict:
             print("PERSONA READ: не получен URL для скачивания")
             return {}
         
-        async with httpx.AsyncClient() as client:
-            resp2 = await client.get(download_url)
+        # Следуем редиректам (302) при скачивании файла
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp2 = await client.get(download_url, timeout=10.0)
         
         if resp2.status_code != 200:
             print(f"PERSONA DOWNLOAD: ошибка {resp2.status_code}")
@@ -223,13 +224,21 @@ async def extract_facts_with_gpt(user_text: str, existing: dict) -> dict:
                 headers=headers, json=payload
             )
         if resp.status_code != 200:
+            print(f"PERSONA GPT ERROR: статус {resp.status_code}")
             return existing
 
         raw = resp.json()["result"]["alternatives"][0]["message"]["text"]
         raw = raw.strip().replace("```json", "").replace("```", "").strip()
-        changes = json.loads(raw)
+        
+        try:
+            changes = json.loads(raw)
+        except json.JSONDecodeError as je:
+            print(f"PERSONA JSON PARSE ERROR: {je}")
+            print(f"RAW TEXT: {raw[:200]}")
+            return existing
 
         if not isinstance(changes, dict):
+            print(f"PERSONA PARSE ERROR: expected dict, got {type(changes)}")
             return existing
 
         add = changes.get("add", {})
@@ -313,10 +322,23 @@ async def understand_intent(user_text: str, persona: dict) -> dict:
                 "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
                 headers=headers, json=payload
             )
-        if resp.status_code == 200:
-            text = resp.json()["result"]["alternatives"][0]["message"]["text"]
-            text = text.strip().replace("```json", "").replace("```", "").strip()
-            return json.loads(text)
+        if resp.status_code != 200:
+            print(f"INTENT GPT ERROR: статус {resp.status_code}")
+            return fallback_intent(user_text)
+        
+        text = resp.json()["result"]["alternatives"][0]["message"]["text"]
+        text = text.strip().replace("```json", "").replace("```", "").strip()
+        
+        try:
+            result = json.loads(text)
+            if isinstance(result, dict) and "intent" in result:
+                return result
+            else:
+                print(f"INTENT PARSE ERROR: unexpected format")
+                return fallback_intent(user_text)
+        except json.JSONDecodeError as je:
+            print(f"INTENT JSON PARSE ERROR: {je}")
+            return fallback_intent(user_text)
     except Exception as e:
         print(f"GPT INTENT ERROR: {e}")
 
@@ -389,42 +411,63 @@ def fallback_intent(text: str) -> dict:
 # ── Яндекс Диск ──────────────────────────────────────────────────────────────
 
 async def list_recent_files(token: str) -> list[dict]:
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://cloud-api.yandex.net/v1/disk/resources/last-uploaded",
-            headers={"Authorization": f"OAuth {token}"},
-            params={"limit": 7, "fields": "items.name,items.path,items.created"}
-        )
-    if resp.status_code != 200:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://cloud-api.yandex.net/v1/disk/resources/last-uploaded",
+                headers={"Authorization": f"OAuth {token}"},
+                params={"limit": 7, "fields": "items.name,items.path,items.created"}
+            )
+        if resp.status_code != 200:
+            print(f"DISK LIST ERROR: {resp.status_code}")
+            return []
+        return resp.json().get("items", [])
+    except Exception as e:
+        print(f"DISK LIST ERROR: {e}")
         return []
-    return resp.json().get("items", [])
 
 
 async def search_disk(token: str, query: str) -> list[dict]:
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://cloud-api.yandex.net/v1/disk/resources/files",
-            headers={"Authorization": f"OAuth {token}"},
-            params={"limit": 20, "fields": "items.name,items.path,items.created"}
-        )
-    if resp.status_code != 200:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://cloud-api.yandex.net/v1/disk/resources/files",
+                headers={"Authorization": f"OAuth {token}"},
+                params={"limit": 20, "fields": "items.name,items.path,items.created"}
+            )
+        if resp.status_code != 200:
+            print(f"DISK SEARCH ERROR: {resp.status_code}")
+            return []
+        items = resp.json().get("items", [])
+        return [i for i in items if query.lower() in i.get("name", "").lower()]
+    except Exception as e:
+        print(f"DISK SEARCH ERROR: {e}")
         return []
-    items = resp.json().get("items", [])
-    return [i for i in items if query.lower() in i.get("name", "").lower()]
 
 
 async def get_public_link(token: str, path: str) -> str | None:
     headers = {"Authorization": f"OAuth {token}"}
-    async with httpx.AsyncClient() as client:
-        await client.put(
-            "https://cloud-api.yandex.net/v1/disk/resources/publish",
-            headers=headers, params={"path": path}
-        )
-        resp = await client.get(
-            "https://cloud-api.yandex.net/v1/disk/resources",
-            headers=headers, params={"path": path, "fields": "public_url"}
-        )
-    return resp.json().get("public_url")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp_pub = await client.put(
+                "https://cloud-api.yandex.net/v1/disk/resources/publish",
+                headers=headers, params={"path": path}
+            )
+            if resp_pub.status_code not in (200, 201):
+                print(f"PUBLISH ERROR: {resp_pub.status_code}")
+                return None
+            
+            resp = await client.get(
+                "https://cloud-api.yandex.net/v1/disk/resources",
+                headers=headers, params={"path": path, "fields": "public_url"}
+            )
+            if resp.status_code != 200:
+                print(f"GET LINK ERROR: {resp.status_code}")
+                return None
+        return resp.json().get("public_url")
+    except Exception as e:
+        print(f"GET PUBLIC LINK ERROR: {e}")
+        return None
 
 
 def format_files(files: list[dict]) -> str:
@@ -438,7 +481,7 @@ def format_files(files: list[dict]) -> str:
 
 async def get_recent_emails(token: str) -> list[dict]:
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 "https://mail.yandex.ru/api/v2/mailbox/folder/message/list",
                 headers={"Authorization": f"OAuth {token}"},
@@ -446,6 +489,8 @@ async def get_recent_emails(token: str) -> list[dict]:
             )
         if resp.status_code == 200:
             return resp.json().get("envelopes", [])
+        else:
+            print(f"MAIL LIST ERROR: {resp.status_code}")
     except Exception as e:
         print(f"MAIL ERROR: {e}")
     return []
@@ -626,8 +671,9 @@ async def persona_load(request: Request):
             return {"error": f"Ошибка доступа к диску: {resp.status_code}"}
 
         download_url = resp.json().get("href")
-        async with httpx.AsyncClient() as client:
-            resp2 = await client.get(download_url)
+        # Следуем редиректам при скачивании файла
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp2 = await client.get(download_url, timeout=10.0)
         return {"content": resp2.text.strip()}
 
     except Exception as e:
