@@ -227,14 +227,31 @@ async def extract_facts_with_gpt(user_text: str, existing: dict) -> dict:
             print(f"PERSONA GPT ERROR: статус {resp.status_code}")
             return existing
 
-        raw = resp.json()["result"]["alternatives"][0]["message"]["text"]
-        raw = raw.strip().replace("```json", "").replace("```", "").strip()
+        response_data = resp.json()
+        if not response_data.get("result") or not response_data["result"].get("alternatives"):
+            print(f"PERSONA GPT ERROR: неправильная структура ответа")
+            return existing
+        
+        raw = response_data["result"]["alternatives"][0].get("message", {}).get("text", "")
+        if not raw:
+            print(f"PERSONA GPT ERROR: пустой ответ от GPT")
+            return existing
+        
+        # Очищаем JSON от markdown форматирования
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1].replace("json", "", 1).strip()
+        raw = raw.strip()
+        
+        if not raw:
+            print(f"PERSONA GPT ERROR: текст стал пустым после очистки")
+            return existing
         
         try:
             changes = json.loads(raw)
         except json.JSONDecodeError as je:
             print(f"PERSONA JSON PARSE ERROR: {je}")
-            print(f"RAW TEXT: {raw[:200]}")
+            print(f"RAW TEXT: {raw[:300]}")
             return existing
 
         if not isinstance(changes, dict):
@@ -326,18 +343,35 @@ async def understand_intent(user_text: str, persona: dict) -> dict:
             print(f"INTENT GPT ERROR: статус {resp.status_code}")
             return fallback_intent(user_text)
         
-        text = resp.json()["result"]["alternatives"][0]["message"]["text"]
-        text = text.strip().replace("```json", "").replace("```", "").strip()
+        response_data = resp.json()
+        if not response_data.get("result") or not response_data["result"].get("alternatives"):
+            print(f"INTENT GPT ERROR: неправильная структура ответа")
+            return fallback_intent(user_text)
+        
+        text = response_data["result"]["alternatives"][0].get("message", {}).get("text", "")
+        if not text:
+            print(f"INTENT GPT ERROR: пустой ответ от GPT")
+            return fallback_intent(user_text)
+        
+        # Очищаем JSON от markdown форматирования
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1].replace("json", "", 1).strip()
+        text = text.strip()
+        
+        if not text:
+            print(f"INTENT GPT ERROR: текст стал пустым после очистки")
+            return fallback_intent(user_text)
         
         try:
             result = json.loads(text)
             if isinstance(result, dict) and "intent" in result:
                 return result
             else:
-                print(f"INTENT PARSE ERROR: unexpected format")
+                print(f"INTENT PARSE ERROR: unexpected format, got {result}")
                 return fallback_intent(user_text)
         except json.JSONDecodeError as je:
-            print(f"INTENT JSON PARSE ERROR: {je}")
+            print(f"INTENT JSON PARSE ERROR: {je}, raw text: {text[:200]}")
             return fallback_intent(user_text)
     except Exception as e:
         print(f"GPT INTENT ERROR: {e}")
@@ -352,8 +386,8 @@ async def chat_with_gpt(message: str, persona: dict) -> str:
 
     system = (
         f"Ты — дружелюбный голосовой ассистент. Помогай пользователю со всеми вопросами. "
-        f"все что хоть как то касается пользователя — учитывай в ответах (его имя, возраст, город, работу и т.д.){persona_block}"
-        f"все что может быть связано с персонализацией пользователя запоминай и используй в ответах. "
+        f"Все что хоть как то касается пользователя — учитывай в ответах (его имя, возраст, город, работу и т.д.). "
+        f"Все что может быть связано с персонализацией пользователя запоминай и используй в ответах. "
         f"Отвечай кратко — максимум 2-3 предложения. "
         f"Будь позитивной, помогающей и поддерживающей. "
         f"Даже если ты не уверена в ответе, всё равно попробуй помочь. "
@@ -379,12 +413,25 @@ async def chat_with_gpt(message: str, persona: dict) -> str:
                 "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
                 headers=headers, json=payload
             )
-        if resp.status_code == 200:
-            return resp.json()["result"]["alternatives"][0]["message"]["text"].strip()
+        if resp.status_code != 200:
+            print(f"CHAT GPT ERROR: статус {resp.status_code}")
+            return "Извини, не смогла ответить на этот вопрос. Попробуй еще раз."
+        
+        response_data = resp.json()
+        if not response_data.get("result") or not response_data["result"].get("alternatives"):
+            print(f"CHAT GPT ERROR: неправильная структура ответа")
+            return "Извини, что-то пошло не так. Попробуй еще раз."
+        
+        text = response_data["result"]["alternatives"][0].get("message", {}).get("text", "")
+        if not text:
+            print(f"CHAT GPT ERROR: пустой ответ от GPT")
+            return "Хм, не знаю что ответить. Спроси что-то другое?"
+        
+        return text.strip()
     except Exception as e:
         print(f"GPT CHAT ERROR: {e}")
 
-    return "Не смогла ответить на этот вопрос."
+    return "Извини, технические трудности. Попробуй позже."
 
 
 def fallback_intent(text: str) -> dict:
