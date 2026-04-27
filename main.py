@@ -13,6 +13,33 @@ PERSONA_PATH = "disk:/persona_alice.txt"
 
 # ── Persona — чтение и запись ─────────────────────────────────────────────────
 
+async def ensure_persona_exists(token: str) -> bool:
+    """Проверяем существует ли файл persona, если нет - создаем пустой"""
+    headers = {"Authorization": f"OAuth {token}"}
+    try:
+        async with httpx.AsyncClient() as client:
+            # Проверяем существует ли файл
+            resp = await client.get(
+                "https://cloud-api.yandex.net/v1/disk/resources",
+                headers=headers,
+                params={"path": PERSONA_PATH}
+            )
+        
+        if resp.status_code == 200:
+            print(f"PERSONA: файл уже существует на диске")
+            return True
+        
+        if resp.status_code == 404:
+            # Файл не существует - создаем пустой
+            print(f"PERSONA: файл не найден, создаем новый...")
+            return await write_persona(token, {}, existing=None)
+        
+        return False
+    except Exception as e:
+        print(f"PERSONA ENSURE ERROR: {e}")
+        return False
+
+
 async def read_persona(token: str) -> dict:
     """Читаем persona_alice.txt и возвращаем как словарь фактов"""
     headers = {"Authorization": f"OAuth {token}"}
@@ -23,22 +50,44 @@ async def read_persona(token: str) -> dict:
                 headers=headers,
                 params={"path": PERSONA_PATH}
             )
+        
+        if resp.status_code == 404:
+            print("PERSONA: файл не найден на диске")
+            # Пытаемся создать
+            await ensure_persona_exists(token)
+            return {}
+        
         if resp.status_code != 200:
-            print("PERSONA: файл не найден, создадим новый")
+            print(f"PERSONA READ: ошибка {resp.status_code}")
             return {}
 
         download_url = resp.json().get("href")
+        if not download_url:
+            print("PERSONA READ: не получен URL для скачивания")
+            return {}
+        
         async with httpx.AsyncClient() as client:
             resp2 = await client.get(download_url)
+        
+        if resp2.status_code != 200:
+            print(f"PERSONA DOWNLOAD: ошибка {resp2.status_code}")
+            return {}
 
         content = resp2.text.strip()
         if not content:
+            print("PERSONA: файл пуст")
             return {}
 
         # Парсим файл в словарь: "ключ: значение"
         facts = {}
         for line in content.split("\n"):
-            line = line.strip().lstrip("- ")
+            line = line.strip()
+            if not line:
+                continue
+            # Убираем "- " в начале если есть
+            if line.startswith("- "):
+                line = line[2:]
+            
             if ":" in line:
                 key, _, val = line.partition(":")
                 key = key.strip().lower()
@@ -46,7 +95,7 @@ async def read_persona(token: str) -> dict:
                 if val and val.lower() != "неизвестно":
                     facts[key] = val
 
-        print(f"PERSONA READ: {facts}")
+        print(f"PERSONA READ: успешно загружено {len(facts)} фактов: {facts}")
         return facts
 
     except Exception as e:
@@ -56,10 +105,9 @@ async def read_persona(token: str) -> dict:
 
 async def write_persona(token: str, facts: dict, existing: dict | None = None) -> bool:
     """Записываем словарь фактов в persona_alice.txt"""
-    if not facts:
-        return True
     # Защита: не записываем если новых данных меньше чем было (что-то пошло не так)
-    if existing and len(facts) < len(existing):
+    # НО: разрешаем пустой файл при первом создании (existing=None)
+    if existing and len(facts) < len(existing) and existing:
         print(f"PERSONA WRITE BLOCKED: попытка записать {len(facts)} фактов вместо {len(existing)}")
         return False
 
@@ -68,17 +116,25 @@ async def write_persona(token: str, facts: dict, existing: dict | None = None) -
 
     headers = {"Authorization": f"OAuth {token}"}
     try:
-        async with httpx.AsyncClient() as client:
+        # Шаг 1: получаем URL для загрузки (файл может существовать или не существовать)
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 "https://cloud-api.yandex.net/v1/disk/resources/upload",
                 headers=headers,
                 params={"path": PERSONA_PATH, "overwrite": "true"}
             )
+        
         if resp.status_code != 200:
+            print(f"PERSONA WRITE ERROR: не удалось получить URL загрузки (статус {resp.status_code})")
             return False
 
         upload_url = resp.json().get("href")
-        async with httpx.AsyncClient() as client:
+        if not upload_url:
+            print("PERSONA WRITE ERROR: не получен URL для загрузки")
+            return False
+
+        # Шаг 2: загружаем файл
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp2 = await client.put(
                 upload_url,
                 content=content.encode("utf-8"),
@@ -86,7 +142,10 @@ async def write_persona(token: str, facts: dict, existing: dict | None = None) -
             )
 
         ok = resp2.status_code in (200, 201)
-        print(f"PERSONA WRITE: {'OK' if ok else 'FAIL ' + str(resp2.status_code)}")
+        if ok:
+            print(f"PERSONA WRITE: успешно сохранено {len(facts)} фактов")
+        else:
+            print(f"PERSONA WRITE ERROR: статус {resp2.status_code}")
         return ok
 
     except Exception as e:
@@ -427,331 +486,48 @@ async def persona_page():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Управление персоной Алисы</title>
+<title>Управление персоной</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  
-  :root {
-    --primary: #FC3F1D;
-    --primary-dark: #E63816;
-    --primary-light: #FFA566;
-    --success: #2e7d32;
-    --error: #c62828;
-    --bg: linear-gradient(135deg, #1e1e2e 0%, #2a2a3e 100%);
-    --card-bg: rgba(255, 255, 255, 0.98);
-    --text: #1a1a1a;
-    --text-light: #666;
-    --border: #e0e0e0;
-    --shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
-    --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.2);
-  }
-  
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: var(--bg);
-    min-height: 100vh;
-    padding: 40px 20px;
-    color: var(--text);
-    overflow-x: hidden;
-  }
-  
-  .container {
-    max-width: 700px;
-    margin: 0 auto;
-  }
-  
-  .header {
-    text-align: center;
-    margin-bottom: 50px;
-    animation: slideDown 0.6s ease-out;
-  }
-  
-  .header-icon {
-    font-size: 56px;
-    margin-bottom: 16px;
-    display: inline-block;
-    animation: float 3s ease-in-out infinite;
-  }
-  
-  h1 {
-    font-size: 32px;
-    font-weight: 700;
-    margin-bottom: 8px;
-    background: linear-gradient(135deg, #FC3F1D, #FFA566);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-  }
-  
-  .tagline {
-    color: #fff;
-    font-size: 15px;
-    opacity: 0.8;
-    font-weight: 300;
-  }
-  
-  .card {
-    background: var(--card-bg);
-    border-radius: 16px;
-    padding: 32px;
-    box-shadow: var(--shadow);
-    margin-bottom: 24px;
-    animation: slideUp 0.6s ease-out backwards;
-    backdrop-filter: blur(10px);
-    border: 1px solid rgba(252, 63, 29, 0.1);
-  }
-  
-  .card:nth-child(1) { animation-delay: 0.1s; }
-  .card:nth-child(2) { animation-delay: 0.2s; }
-  
-  .step {
-    font-size: 12px;
-    font-weight: 700;
-    color: var(--primary);
-    text-transform: uppercase;
-    letter-spacing: 1.2px;
-    margin-bottom: 16px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  
-  .step::before {
-    content: '✨';
-    font-size: 16px;
-  }
-  
-  .input-group {
-    margin-bottom: 16px;
-  }
-  
-  input[type=text],
-  textarea {
-    width: 100%;
-    padding: 14px 16px;
-    border: 2px solid var(--border);
-    border-radius: 10px;
-    font-size: 15px;
-    font-family: -apple-system, sans-serif;
-    outline: none;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    background: #fafafa;
-  }
-  
-  input[type=text]:focus,
-  textarea:focus {
-    border-color: var(--primary);
-    background: white;
-    box-shadow: 0 0 0 3px rgba(252, 63, 29, 0.1);
-    transform: translateY(-2px);
-  }
-  
-  textarea {
-    height: 240px;
-    font-family: 'Monaco', 'Menlo', monospace;
-    font-size: 14px;
-    resize: vertical;
-    color: #1e1e1e;
-    line-height: 1.6;
-  }
-  
-  .hint {
-    font-size: 13px;
-    color: var(--text-light);
-    margin-top: 10px;
-    line-height: 1.5;
-  }
-  
-  .hint a {
-    color: var(--primary);
-    text-decoration: none;
-    font-weight: 600;
-    transition: color 0.2s;
-  }
-  
-  .hint a:hover {
-    color: var(--primary-dark);
-    text-decoration: underline;
-  }
-  
-  button {
-    background: linear-gradient(135deg, var(--primary), var(--primary-dark));
-    color: white;
-    border: none;
-    padding: 14px 28px;
-    border-radius: 10px;
-    font-size: 15px;
-    font-weight: 600;
-    cursor: pointer;
-    width: 100%;
-    margin-top: 20px;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    position: relative;
-    overflow: hidden;
-    box-shadow: 0 4px 15px rgba(252, 63, 29, 0.3);
-  }
-  
-  button::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: -100%;
-    width: 100%;
-    height: 100%;
-    background: rgba(255, 255, 255, 0.2);
-    transition: left 0.5s;
-  }
-  
-  button:hover:not(:disabled) {
-    transform: translateY(-2px);
-    box-shadow: 0 6px 20px rgba(252, 63, 29, 0.4);
-  }
-  
-  button:hover:not(:disabled)::before {
-    left: 100%;
-  }
-  
-  button:active:not(:disabled) {
-    transform: translateY(0);
-  }
-  
-  button:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-    transform: none;
-  }
-  
-  .spinner {
-    display: inline-block;
-    width: 14px;
-    height: 14px;
-    border: 2px solid rgba(255, 255, 255, 0.3);
-    border-top-color: white;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    margin-right: 8px;
-  }
-  
-  .msg {
-    margin-top: 16px;
-    padding: 14px 16px;
-    border-radius: 10px;
-    font-size: 14px;
-    display: none;
-    animation: slideIn 0.3s ease-out;
-    border-left: 4px solid transparent;
-    word-break: break-word;
-  }
-  
-  .msg.ok {
-    background: linear-gradient(135deg, rgba(46, 125, 50, 0.1), rgba(76, 175, 80, 0.05));
-    color: var(--success);
-    border-left-color: var(--success);
-    display: block;
-  }
-  
-  .msg.err {
-    background: linear-gradient(135deg, rgba(198, 40, 40, 0.1), rgba(244, 67, 54, 0.05));
-    color: var(--error);
-    border-left-color: var(--error);
-    display: block;
-  }
-  
-  .msg::before {
-    content: '✓ ';
-    font-weight: 700;
-  }
-  
-  .msg.err::before {
-    content: '⚠ ';
-  }
-  
-  #edit-card {
-    display: none;
-  }
-  
-  @keyframes slideDown {
-    from {
-      opacity: 0;
-      transform: translateY(-30px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-  
-  @keyframes slideUp {
-    from {
-      opacity: 0;
-      transform: translateY(30px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-  
-  @keyframes slideIn {
-    from {
-      opacity: 0;
-      transform: translateX(-10px);
-    }
-    to {
-      opacity: 1;
-      transform: translateX(0);
-    }
-  }
-  
-  @keyframes float {
-    0%, 100% { transform: translateY(0px); }
-    50% { transform: translateY(-10px); }
-  }
-  
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-  
-  @media (max-width: 600px) {
-    body { padding: 24px 16px; }
-    .card { padding: 24px; }
-    h1 { font-size: 28px; }
-    .header-icon { font-size: 48px; }
-    button { padding: 12px 20px; font-size: 14px; }
-    textarea { height: 180px; }
-  }
+  body { font-family: -apple-system, sans-serif; background: #f5f5f5; min-height: 100vh; padding: 20px; }
+  .container { max-width: 600px; margin: 0 auto; }
+  h1 { font-size: 24px; margin-bottom: 8px; color: #111; }
+  p.sub { color: #666; margin-bottom: 24px; font-size: 14px; }
+  .card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-bottom: 16px; }
+  .step { font-size: 13px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+  input[type=text] { width: 100%; padding: 10px 14px; border: 1.5px solid #e0e0e0; border-radius: 8px; font-size: 15px; outline: none; transition: border 0.2s; }
+  input[type=text]:focus { border-color: #FC3F1D; }
+  textarea { width: 100%; height: 200px; padding: 12px 14px; border: 1.5px solid #e0e0e0; border-radius: 8px; font-size: 14px; font-family: monospace; resize: vertical; outline: none; transition: border 0.2s; }
+  textarea:focus { border-color: #FC3F1D; }
+  button { background: #FC3F1D; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; width: 100%; margin-top: 12px; transition: opacity 0.2s; }
+  button:hover { opacity: 0.85; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .msg { margin-top: 12px; padding: 10px 14px; border-radius: 8px; font-size: 14px; display: none; }
+  .msg.ok { background: #e8f5e9; color: #2e7d32; display: block; }
+  .msg.err { background: #ffebee; color: #c62828; display: block; }
+  .hint { font-size: 13px; color: #888; margin-top: 8px; }
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="header">
-    <div class="header-icon">🤖</div>
-    <h1>Alice</h1>
-    <p class="tagline">Управление персональным профилем</p>
-  </div>
+  <h1>🤖 Управление персоной</h1>
+  <p class="sub">Здесь можно посмотреть и отредактировать что ассистент знает о вас</p>
 
   <div class="card">
-    <div class="step">Шаг 1 — Аутентификация</div>
-    <div class="input-group">
-      <input type="text" id="token" placeholder="Введите OAuth токен (y0_AgAAAA...)" />
-    </div>
-    <p class="hint">
-      🔐 Как получить токен: откройте в браузере
-      <a href="https://oauth.yandex.ru/authorize?response_type=token&client_id=807ee186b02f460192b31c5394e685b2" target="_blank">страницу авторизации</a>
-      и скопируйте токен из адресной строки после <code>access_token=</code>
+    <div class="step">Шаг 1 — введите ваш OAuth токен</div>
+    <input type="text" id="token" placeholder="y0_AgAAAA..." />
+    <p class="hint">Получить токен: откройте в браузере →
+      <a href="https://oauth.yandex.ru/authorize?response_type=token&client_id=807ee186b02f460192b31c5394e685b2" target="_blank">получить токен</a>
+      и скопируйте из адресной строки после access_token=
     </p>
-    <button onclick="loadPersona()">Загрузить профиль</button>
+    <button onclick="loadPersona()">Загрузить мою персону</button>
     <div id="load-msg" class="msg"></div>
   </div>
 
-  <div class="card" id="edit-card">
-    <div class="step">Шаг 2 — Редактирование</div>
-    <div class="input-group">
-      <textarea id="persona-text" placeholder="- имя: Алиса&#10;- возраст: 25&#10;- город: Москва"></textarea>
-    </div>
-    <p class="hint">
-      📝 Формат: каждая строка начинается с дефиса и двоеточия. Удалите строку чтобы забыть факт.
-    </p>
+  <div class="card" id="edit-card" style="display:none">
+    <div class="step">Шаг 2 — редактируйте и сохраняйте</div>
+    <textarea id="persona-text"></textarea>
+    <p class="hint">Каждая строка: "- ключ: значение". Удалите строку чтобы убрать факт.</p>
     <button onclick="savePersona()">💾 Сохранить изменения</button>
     <div id="save-msg" class="msg"></div>
   </div>
@@ -762,16 +538,12 @@ let currentToken = '';
 
 async function loadPersona() {
   const token = document.getElementById('token').value.trim();
-  if (!token) {
-    showMsg('load-msg', 'Введите токен', false);
-    return;
-  }
+  if (!token) { showMsg('load-msg', 'Введите токен', false); return; }
   currentToken = token;
 
   const btn = event.target;
-  const originalText = btn.textContent;
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Загружаю...';
+  btn.textContent = 'Загружаю...';
 
   try {
     const r = await fetch('/persona/load', {
@@ -781,27 +553,25 @@ async function loadPersona() {
     });
     const data = await r.json();
     if (data.content !== undefined) {
-      document.getElementById('persona-text').value = data.content || '';
+      document.getElementById('persona-text').value = data.content || '(файл пуст)';
       document.getElementById('edit-card').style.display = 'block';
-      setTimeout(() => document.getElementById('edit-card').scrollIntoView({behavior: 'smooth'}), 100);
-      showMsg('load-msg', 'Профиль загружен успешно!', true);
+      showMsg('load-msg', 'Персона загружена!', true);
     } else {
-      showMsg('load-msg', data.error || 'Ошибка загрузки профиля', false);
+      showMsg('load-msg', data.error || 'Ошибка загрузки', false);
     }
   } catch(e) {
     showMsg('load-msg', 'Ошибка: ' + e.message, false);
   }
 
   btn.disabled = false;
-  btn.textContent = originalText;
+  btn.textContent = 'Загрузить мою персону';
 }
 
 async function savePersona() {
   const content = document.getElementById('persona-text').value.trim();
   const btn = event.target;
-  const originalText = btn.textContent;
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Сохраняю...';
+  btn.textContent = 'Сохраняю...';
 
   try {
     const r = await fetch('/persona/save', {
@@ -811,7 +581,7 @@ async function savePersona() {
     });
     const data = await r.json();
     if (data.ok) {
-      showMsg('save-msg', 'Профиль сохранён! Alice учтёт изменения при следующем диалоге.', true);
+      showMsg('save-msg', 'Сохранено! Ассистент учтёт изменения при следующем запуске.', true);
     } else {
       showMsg('save-msg', data.error || 'Ошибка сохранения', false);
     }
@@ -820,7 +590,7 @@ async function savePersona() {
   }
 
   btn.disabled = false;
-  btn.textContent = originalText;
+  btn.textContent = '💾 Сохранить изменения';
 }
 
 function showMsg(id, text, ok) {
@@ -916,6 +686,9 @@ async def alice_webhook(request: Request):
 
     # ── Загружаем персону (при новой сессии или если нет в памяти) ────────────
     if session_id not in sessions:
+        # При первом обращении - убеждаемся что файл существует
+        await ensure_persona_exists(user_token)
+        # Теперь читаем файл (он гарантированно существует)
         persona = await read_persona(user_token)
         sessions[session_id] = {"persona": persona, "files": []}
 
