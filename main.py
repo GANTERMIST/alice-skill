@@ -3,6 +3,7 @@ import uvicorn
 import httpx
 import json
 import os
+import random
 from datetime import date, timedelta
 
 app = FastAPI()
@@ -11,14 +12,24 @@ YANDEX_GPT_API_KEY = os.getenv("YANDEX_GPT_API_KEY")
 YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")
 PERSONA_PATH = "disk:/persona_alice.txt"
 
-# ── Persona — чтение и запись ─────────────────────────────────────────────────
+# ── Совет дня (легко редактируемый список) ────────────────────────────────
+DAILY_TIPS = [
+    "Пей воду перед кофе — голова будет яснее.",
+    "Делай одно дело за раз — закончишь быстрее.",
+    "Если что-то непонятно — спроси у ассистента.",
+    "Проветри комнату перед сном.",
+    "Улыбнись — это бесплатный буст настроения.",
+    "Запиши три главные задачи на сегодня — станет легче.",
+    "Попробуй технику «помидора»: 25 минут работы, 5 отдыха.",
+]
+
+# ── Persona — чтение и запись ─────────────────────────────────────────────
 
 async def ensure_persona_exists(token: str) -> bool:
     """Проверяем существует ли файл persona, если нет - создаем пустой"""
     headers = {"Authorization": f"OAuth {token}"}
     try:
         async with httpx.AsyncClient() as client:
-            # Проверяем существует ли файл
             resp = await client.get(
                 "https://cloud-api.yandex.net/v1/disk/resources",
                 headers=headers,
@@ -30,7 +41,6 @@ async def ensure_persona_exists(token: str) -> bool:
             return True
         
         if resp.status_code == 404:
-            # Файл не существует - создаем пустой
             print(f"PERSONA: файл не найден, создаем новый...")
             return await write_persona(token, {}, existing=None)
         
@@ -53,7 +63,6 @@ async def read_persona(token: str) -> dict:
         
         if resp.status_code == 404:
             print("PERSONA: файл не найден на диске")
-            # Пытаемся создать
             await ensure_persona_exists(token)
             return {}
         
@@ -66,7 +75,6 @@ async def read_persona(token: str) -> dict:
             print("PERSONA READ: не получен URL для скачивания")
             return {}
         
-        # Следуем редиректам (302) при скачивании файла
         async with httpx.AsyncClient(follow_redirects=True) as client:
             resp2 = await client.get(download_url, timeout=10.0)
         
@@ -79,13 +87,11 @@ async def read_persona(token: str) -> dict:
             print("PERSONA: файл пуст")
             return {}
 
-        # Парсим файл в словарь: "ключ: значение"
         facts = {}
         for line in content.split("\n"):
             line = line.strip()
             if not line:
                 continue
-            # Убираем "- " в начале если есть
             if line.startswith("- "):
                 line = line[2:]
             
@@ -106,8 +112,6 @@ async def read_persona(token: str) -> dict:
 
 async def write_persona(token: str, facts: dict, existing: dict | None = None) -> bool:
     """Записываем словарь фактов в persona_alice.txt"""
-    # Защита: не записываем если новых данных меньше чем было (что-то пошло не так)
-    # НО: разрешаем пустой файл при первом создании (existing=None)
     if existing and len(facts) < len(existing) and existing:
         print(f"PERSONA WRITE BLOCKED: попытка записать {len(facts)} фактов вместо {len(existing)}")
         return False
@@ -117,7 +121,6 @@ async def write_persona(token: str, facts: dict, existing: dict | None = None) -
 
     headers = {"Authorization": f"OAuth {token}"}
     try:
-        # Шаг 1: получаем URL для загрузки (файл может существовать или не существовать)
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 "https://cloud-api.yandex.net/v1/disk/resources/upload",
@@ -134,7 +137,6 @@ async def write_persona(token: str, facts: dict, existing: dict | None = None) -
             print("PERSONA WRITE ERROR: не получен URL для загрузки")
             return False
 
-        # Шаг 2: загружаем файл
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp2 = await client.put(
                 upload_url,
@@ -167,14 +169,12 @@ async def extract_facts_with_gpt(user_text: str, existing: dict) -> dict:
     text_lower = user_text.lower()
     if any(w in text_lower for w in ["забудь", "удали", "не запоминай", "сотри"]):
         merged = dict(existing)
-        # Ищем какой именно факт удалить
         for key in list(existing.keys()):
             if key in text_lower:
                 merged.pop(key, None)
                 print(f"PERSONA DELETE (explicit): {key}")
         if merged != existing:
             return merged
-        # Если не поняли что именно удалять — оставляем как есть
         return existing
 
     existing_str = json.dumps(existing, ensure_ascii=False) if existing else "{}"
@@ -237,7 +237,6 @@ async def extract_facts_with_gpt(user_text: str, existing: dict) -> dict:
             print(f"PERSONA GPT ERROR: пустой ответ от GPT")
             return existing
         
-        # Очищаем JSON от markdown форматирования
         raw = raw.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1].replace("json", "", 1).strip()
@@ -261,25 +260,22 @@ async def extract_facts_with_gpt(user_text: str, existing: dict) -> dict:
         add = changes.get("add", {})
         update = changes.get("update", {})
 
-        # Нет изменений — возвращаем существующие данные без изменений
         if not add and not update:
             return existing
 
-        # Безопасный мерж: копируем ВСЕ старые факты и добавляем/обновляем новые
-        merged = dict(existing)  # полная копия — ничего не теряем
+        merged = dict(existing)
 
         for key, val in add.items():
-            if key and val and key not in merged:  # добавляем только если нет
+            if key and val and key not in merged:
                 merged[key] = str(val).strip()
 
         for key, val in update.items():
-            if key and val and key in existing:  # обновляем только существующие ключи
+            if key and val and key in existing:
                 merged[key] = str(val).strip()
 
-        # Финальная проверка: merged должен содержать ВСЕ ключи из existing
         for key in existing:
             if key not in merged:
-                merged[key] = existing[key]  # восстанавливаем если что-то потерялось
+                merged[key] = existing[key]
 
         print(f"PERSONA CHANGES — add:{add} update:{update}")
         return merged
@@ -287,11 +283,10 @@ async def extract_facts_with_gpt(user_text: str, existing: dict) -> dict:
     except Exception as e:
         print(f"PERSONA EXTRACT ERROR: {e}")
 
-    # При любой ошибке возвращаем старые данные нетронутыми
     return existing
 
 
-# ── YandexGPT ────────────────────────────────────────────────────────────────
+# ── YandexGPT ─────────────────────────────────────────────────────────────
 
 async def understand_intent(user_text: str, persona: dict) -> dict:
     persona_lines = "\n".join(f"- {k}: {v}" for k, v in persona.items())
@@ -311,6 +306,7 @@ async def understand_intent(user_text: str, persona: dict) -> dict:
 - chat — разговор или вопрос (параметр "message")
 - help — помощь
 - exit — выход
+- tip — пользователь просит совет, лайфхак или полезную рекомендацию
 
 Примеры:
 "найди файл отчёт" -> {{"intent": "search_disk", "query": "отчёт"}}
@@ -320,6 +316,8 @@ async def understand_intent(user_text: str, persona: dict) -> dict:
 "как меня зовут" -> {{"intent": "chat", "message": "как меня зовут"}}
 "привет" -> {{"intent": "chat", "message": "привет"}}
 "пока" -> {{"intent": "exit"}}
+"дай совет" -> {{"intent": "tip"}}
+"какой сегодня лайфхак" -> {{"intent": "tip"}}
 
 Верни ТОЛЬКО JSON:"""
 
@@ -353,7 +351,6 @@ async def understand_intent(user_text: str, persona: dict) -> dict:
             print(f"INTENT GPT ERROR: пустой ответ от GPT")
             return fallback_intent(user_text)
         
-        # Очищаем JSON от markdown форматирования
         text = text.strip()
         if text.startswith("```"):
             text = text.split("```")[1].replace("json", "", 1).strip()
@@ -449,6 +446,8 @@ def fallback_intent(text: str) -> dict:
         return {"intent": "exit"}
     if any(w in t for w in ["помощь", "помоги"]):
         return {"intent": "help"}
+    if any(w in t for w in ["совет", "лайфхак", "совет дня", "полезность"]):
+        return {"intent": "tip"}
     numbers = {
         "1": 1, "2": 2, "3": 3, "4": 4, "5": 5,
         "первый": 1, "второй": 2, "третий": 3, "четвёртый": 4, "пятый": 5,
@@ -460,7 +459,7 @@ def fallback_intent(text: str) -> dict:
     return {"intent": "chat", "message": text}
 
 
-# ── Яндекс Диск ──────────────────────────────────────────────────────────────
+# ── Яндекс Диск ──────────────────────────────────────────────────────────
 
 async def list_recent_files(token: str) -> list[dict]:
     try:
@@ -529,7 +528,7 @@ def format_files(files: list[dict]) -> str:
     return "Нашла: " + ", ".join(lines)
 
 
-# ── Яндекс Почта ─────────────────────────────────────────────────────────────
+# ── Яндекс Почта ─────────────────────────────────────────────────────────
 
 async def get_recent_emails(token: str) -> list[dict]:
     try:
@@ -562,11 +561,11 @@ def format_emails(emails: list[dict]) -> str:
     return "Последние письма: " + ". ".join(lines)
 
 
-# ── Сессии ────────────────────────────────────────────────────────────────────
+# ── Сессии ────────────────────────────────────────────────────────────────
 sessions: dict[str, dict] = {}
 
 
-# ── Webhook ───────────────────────────────────────────────────────────────────
+# ── Webhook ───────────────────────────────────────────────────────────────
 
 from fastapi.responses import HTMLResponse
 
@@ -723,7 +722,6 @@ async def persona_load(request: Request):
             return {"error": f"Ошибка доступа к диску: {resp.status_code}"}
 
         download_url = resp.json().get("href")
-        # Следуем редиректам при скачивании файла
         async with httpx.AsyncClient(follow_redirects=True) as client:
             resp2 = await client.get(download_url, timeout=10.0)
         return {"content": resp2.text.strip()}
@@ -782,27 +780,18 @@ async def alice_webhook(request: Request):
             "version": "1.0"
         }
 
-    # ── Загружаем персону (при новой сессии или если нет в памяти) ────────────
     if session_id not in sessions:
-        # При первом обращении - убеждаемся что файл существует
         await ensure_persona_exists(user_token)
-        # Теперь читаем файл (он гарантированно существует)
         persona = await read_persona(user_token)
         sessions[session_id] = {"persona": persona, "files": []}
 
     persona: dict = sessions[session_id]["persona"]
 
-    # ── Новая сессия — приветствие ────────────────────────────────────────────
     if is_new_session:
         name = persona.get("имя", "")
         greeting = f"С возвращением, {name}! Чем помочь?" if name else "Привет! Я твой ассистент. Говори свободно — пойму любую фразу."
         return _reply(greeting)
 
-    # ── Сервер перезапустился — сессия потеряна, но сообщение уже идёт ────────
-    # message_id > 0 и new=false означает что сессия была но сервер перезапустился
-    # Просто продолжаем с загруженной персоной, не прерываем диалог
-
-    # ── GPT извлекает факты из сообщения и обновляет персону ───────────────────
     updated_persona = await extract_facts_with_gpt(user_text, persona)
     if updated_persona != persona:
         sessions[session_id]["persona"] = updated_persona
@@ -810,7 +799,6 @@ async def alice_webhook(request: Request):
         print(f"PERSONA UPDATED: {updated_persona}")
         persona = updated_persona
 
-    # ── GPT определяет намерение ──────────────────────────────────────────────
     intent_data = await understand_intent(user_text, persona)
     intent = intent_data.get("intent", "unknown")
     print(f"INTENT: {intent_data}")
@@ -864,10 +852,13 @@ async def alice_webhook(request: Request):
     elif intent == "exit":
         return _reply("До встречи!", end=True)
 
+    # ── НОВАЯ ФИШКА: совет дня ──────────────────────────────────────────
+    elif intent == "tip":
+        reply_text = random.choice(DAILY_TIPS)
+
     else:
         reply_text = "Не поняла. Попробуй: покажи файлы, прочитай почту, или задай вопрос."
 
-    # Гарантируем что ответ никогда не пустой
     if not reply_text.strip():
         name = persona.get("имя", "")
         reply_text = f"Слушаю, {name}! Чем помочь?" if name else "Слушаю! Чем помочь?"
